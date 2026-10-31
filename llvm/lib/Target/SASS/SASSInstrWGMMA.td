@@ -20,7 +20,6 @@ def gmmaacc : Operand<untyped> {
 }
 def GMMAFrag : RegisterOperand<GPR128, "printGMMAFrag">;
 def GDesc128 : RegisterOperand<UGPR128, "printGDesc">;
-def GDesc64 : RegisterOperand<UGPR64A4, "printGDesc">;
 def GMMAUP : RegisterOperand<UPREDT, "printGMMAUP">;
 
 // GMMA reads its sources and writes the accumulators asynchronously until
@@ -33,18 +32,22 @@ let Constraints = "$d = $c" in {
 def GMMA_SS : SASSInst<(outs gmmaacc:$d),
                        (ins gmmaflags:$f, gmmaacc:$c, GDesc128:$ab, GMMAUP:$up, gmmagsb:$gsb),
                        "$f $d, gdesc[$ab], $c$up$gsb">;
-// RS: A from four registers, B from a descriptor pair.
+// RS: A from four registers; B's descriptor is the upper pair of the
+// uniform quad (as ptxas emits it: gdesc[UR8] reads UR10:UR11).
 def GMMA_RS : SASSInst<(outs gmmaacc:$d),
-                       (ins gmmaflags:$f, GMMAFrag:$a, GDesc64:$b, gmmaacc:$c, GMMAUP:$up,
+                       (ins gmmaflags:$f, GMMAFrag:$a, GDesc128:$b, gmmaacc:$c, GMMAUP:$up,
                             gmmagsb:$gsb),
                        "$f $d, $a, gdesc[$b], $c$up$gsb">;
 }
-// scale-d = 0: the accumulators are not read.
+// scale-d = 0: the accumulators are not read. The A fragment is read while
+// the accumulators are written, so they must not share registers.
+let Constraints = "@earlyclobber $d" in {
 def GMMA_SS_Z : SASSInst<(outs gmmaacc:$d), (ins gmmaflags:$f, GDesc128:$ab, gmmagsb:$gsb),
                          "$f $d, gdesc[$ab], RZ, !UPT$gsb">;
 def GMMA_RS_Z : SASSInst<(outs gmmaacc:$d),
-                         (ins gmmaflags:$f, GMMAFrag:$a, GDesc64:$b, gmmagsb:$gsb),
+                         (ins gmmaflags:$f, GMMAFrag:$a, GDesc128:$b, gmmagsb:$gsb),
                          "$f $d, $a, gdesc[$b], RZ, !UPT$gsb">;
+}
 }
 
 def wgmma_count : SDNodeXForm<timm, [{

@@ -577,6 +577,10 @@ MachineBasicBlock *SASS::expandPTXUniform(MachineInstr &MI, MachineBasicBlock *B
     return U;
   };
   Register Done;
+  // Threads the iteration retires (the leader), and the block that ends the
+  // iteration.
+  Register Retired = Lead;
+  MachineBasicBlock *Latch = Loop;
   switch (Opc) {
   case SASS::UNI_SYNCS_EXCH: {
     Register A = ToUR(MI.getOperand(0));
@@ -592,11 +596,46 @@ MachineBasicBlock *SASS::expandPTXUniform(MachineInstr &MI, MachineBasicBlock *B
   }
   case SASS::UNI_ARRIVES_ARVCNT:
   case SASS::UNI_ARRIVES_TRANSCNT: {
+    // ARRIVES arrives once for every active thread, so it is issued by
+    // exactly the pending threads with the leader's barrier address:
+    // Loop -> Body (ARRIVES) -> Latch, Loop -> Latch for the others.
     Register A = ToUR(MI.getOperand(0));
-    MachineInstrBuilder M = Build(*Loop, Opc == SASS::UNI_ARRIVES_ARVCNT ? SASS::ARRIVES_ARVCNT
+    Register AV = NewReg(&SASS::GPR32RegClass);
+    {
+      MachineInstrBuilder M = Build(*Loop, SASS::MOVru, AV);
+      M.addReg(A);
+      Guard(M);
+    }
+    Retired = NewReg(&SASS::PREDRegClass);
+    {
+      MachineInstrBuilder M = Build(*Loop, SASS::ISETPrr, Retired);
+      M.addReg(MI.getOperand(0).getReg()).addReg(AV).addImm(4 /*EQ*/).addReg(Pend).addImm(0);
+      Guard(M);
+    }
+    MachineBasicBlock *Body = MF.CreateMachineBasicBlock(BB->getBasicBlock());
+    Latch = MF.CreateMachineBasicBlock(BB->getBasicBlock());
+    MF.insert(Tail->getIterator(), Body);
+    MF.insert(Tail->getIterator(), Latch);
+    Loop->removeSuccessor(Loop);
+    Loop->removeSuccessor(Tail);
+    Loop->addSuccessor(Body);
+    Loop->addSuccessor(Latch);
+    Body->addSuccessor(Latch);
+    Latch->addSuccessor(Loop);
+    Latch->addSuccessor(Tail);
+    {
+      MachineInstrBuilder M = Build(*Loop, SASS::BRAc);
+      M.addMBB(Latch);
+      Guard(M, Retired, /*Neg=*/true);
+    }
+    MachineInstrBuilder M = Build(*Body, Opc == SASS::UNI_ARRIVES_ARVCNT ? SASS::ARRIVES_ARVCNT
                                                                          : SASS::ARRIVES_TRANSCNT);
     M.addReg(A);
     Guard(M);
+    for (MachineInstr &Phi : Loop->phis())
+      for (MachineOperand &MO : Phi.operands())
+        if (MO.isMBB() && MO.getMBB() == Loop)
+          MO.setMBB(Latch);
     break;
   }
   case SASS::UNI_UBLKCP_SG: {
@@ -670,14 +709,14 @@ MachineBasicBlock *SASS::expandPTXUniform(MachineInstr &MI, MachineBasicBlock *B
     break;
   }
   }
-  // Pending: still pending and not the leader.
+  // Pending: still pending and not retired.
   {
-    MachineInstrBuilder M = Build(*Loop, SASS::PLOP3, Next);
-    M.addReg(Pend).addReg(Lead).addImm(0x30);
+    MachineInstrBuilder M = Build(*Latch, SASS::PLOP3, Next);
+    M.addReg(Pend).addReg(Retired).addImm(0x30);
     Guard(M);
   }
   {
-    MachineInstrBuilder M = Build(*Loop, SASS::BRA_U_ANY);
+    MachineInstrBuilder M = Build(*Latch, SASS::BRA_U_ANY);
     M.addMBB(Loop);
     Guard(M, Next);
   }

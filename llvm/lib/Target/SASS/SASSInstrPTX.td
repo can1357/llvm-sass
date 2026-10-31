@@ -66,6 +66,13 @@ def ACQBULK : SASSInst<(outs), (ins), "ACQBULK", [(int_nvvm_griddepcontrol_wait)
 def PREEXIT : SASSInst<(outs), (ins), "PREEXIT", [(int_nvvm_griddepcontrol_launch_dependents)]>;
 def BPT_TRAP : SASSInst<(outs), (ins), "BPT.TRAP 0x1", [(trap)]>;
 }
+// __nanosleep(t): NANOSLEEP on the control-flow unit.
+let LatMnem = LAT_BRA, hasSideEffects = 1 in {
+def NANOSLEEPi : SASSInst<(outs), (ins simm32:$t), "NANOSLEEP $t",
+                          [(int_nvvm_nanosleep (i32 imm:$t))]>;
+def NANOSLEEPr : SASSInst<(outs), (ins GPR32:$t), "NANOSLEEP $t",
+                          [(int_nvvm_nanosleep i32:$t)]>;
+}
 
 // Special registers. CS2R reads 64-bit counters on the integer pipe.
 let LatMnem = LAT_SEL, hasSideEffects = 1 in {
@@ -245,7 +252,7 @@ def UNI_UTMASTG : SASSInst<(outs), (ins i32imm:$dim, G64:$map, GPR32:$s,
 
 // Loop pieces for the expansion.
 let isPredicable = 0, NoGuard = 1, hasSideEffects = 1 in {
-let LatMnem = LAT_BRA, SchedRW = [WriteBR] in
+let LatMnem = LAT_ELECT in
 def ELECT_P : SASSInst<(outs PRED:$lead), (ins PRED:$among), "ELECT $lead, URZ, $among">;
 let LatMnem = LAT_BRA, SchedRW = [WriteBR], MinStall = 5, isBranch = 1, isTerminator = 1 in
 def BRA_U_ANY : SASSInst<(outs), (ins brtarget:$t), "BRA.U.ANY $t">;
@@ -254,7 +261,7 @@ let LatMnem = LAT_R2UR in
 def R2UR_G : SASSInst<(outs UGPR32:$d), (ins GPR32:$a), "R2UR PT, $d, $a">;
 
 // elect.sync: the elected lane gets the predicate; every lane the leader's id.
-let LatMnem = LAT_BRA, SchedRW = [WriteBR], isPredicable = 0, NoGuard = 1, hasSideEffects = 1 in
+let LatMnem = LAT_ELECT, isPredicable = 0, NoGuard = 1, hasSideEffects = 1 in
 def ELECT : SASSInst<(outs PRED:$p, UGPR32:$lane), (ins), "ELECT $p, $lane, PT">;
 
 //===----------------------------------------------------------------------===//

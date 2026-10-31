@@ -27,6 +27,9 @@ public:
   bool hasBranchDivergence(const Function *F = nullptr) const override {
     return true;
   }
+  /// Thread indices, atomics, warp collectives, generic/local loads and
+  /// calls are divergent (SASSReconverge.cpp).
+  ValueUniformity getValueUniformity(const Value *V) const override;
   /// Address space 0 is CUDA's generic space.
   unsigned getFlatAddressSpace() const override { return 0; }
 

@@ -52,6 +52,8 @@ public:
     addPass(createSASSExpandInlinePTXPass());
     addPass(createSASSLowerInlinePTXPass());
     addPass(createSASSLowerMathPass());
+    addPass(createSASSLowerIEEEPass());
+    addPass(createSASSLowerIntDivPass());
     // Before loop strength reduction, which rewrites the byte extracts of
     // `x + i` as separately shifted induction variables.
     if (getOptLevel() != CodeGenOptLevel::None)
@@ -104,6 +106,7 @@ public:
 
   // Control codes depend on the final instruction order and block layout.
   void addPreEmitPass2() override {
+    addPass(createSASSReconvergePass());
     addPass(createSASSWGMMAHazardsPass());
     addPass(createSASSControlCodesPass());
   }
@@ -136,12 +139,15 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeSASSTarget() {
   initializeSASSLowerAllocaPass(PR);
   initializeSASSLowerInlinePTXPass(PR);
   initializeSASSLowerMathPass(PR);
+  initializeSASSLowerIEEEPass(PR);
+  initializeSASSLowerIntDivPass(PR);
   initializeSASSLiftIdiomsPass(PR);
   initializeSASSExpandInlinePTXPass(PR);
   initializeSASSPreRASchedPass(PR);
   initializeSASSUniformAddrPass(PR);
   initializeSASSExpandWGMMAPass(PR);
   initializeSASSWGMMAHazardsPass(PR);
+  initializeSASSReconvergePass(PR);
   initializeSASSLowerMemcpyPass(PR);
   initializeSASSInlineCallsPass(PR);
 }

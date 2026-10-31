@@ -12,7 +12,8 @@
 // "l" constraints below) and SASSExpandWGMMA rewrites it, in SSA form before
 // register allocation, into GMMA_* (SASSInstrWGMMA.td): REG_SEQUENCEs build
 // the accumulator tuple, A fragment and the uniform descriptor tuple
-// (R2UR: .sync.aligned operands are warp-uniform), and sub-register COPYs
+// (R2UR: .sync.aligned operands are warp-uniform; B is always the upper
+// pair, also in the RS form), and sub-register COPYs
 // hand the results back, so the register coalescer keeps a whole
 // accumulator chain in one tuple. Doing this on MachineInstrs rather than
 // in DAG selection keeps the inline-asm operand plumbing (copies, tied
@@ -36,7 +37,8 @@
 // * keeps instructions off registers that in-flight GMMAs read or write
 //   (accumulators, A fragment) by inserting WARPGROUP.DEPBAR.LE gsb0, 0x0,
 //   and inserts WARPGROUP.ARRIVE before a GMMA whose register sources were
-//   written since the last one (ptxas remarks C7514 / C7519),
+//   written since the last one (ptxas remarks C7514 / C7519), each arrive
+//   preceded by WARPSYNC.ALL to reconverge the warp,
 // * checks that each region after a setmaxnreg uses only registers below
 //   its count.
 //
@@ -46,6 +48,7 @@
 #include "SASS.h"
 #include "SASSISelLowering.h"
 #include "SASSInstrInfo.h"
+#include "SASSMachineFunctionInfo.h"
 #include "SASSRegisterInfo.h"
 #include "SASSSubtarget.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -175,6 +178,74 @@ unsigned SASS::setMaxRegLimit(const MachineFunction &MF) {
 }
 
 static void noGuard(const MachineInstrBuilder &MIB) { MIB.addReg(SASS::PT).addImm(0); }
+
+/// Register count after \p MI if it is a USETMAXREG, else \p L.
+static unsigned limitAfter(const MachineInstr &MI, unsigned L) {
+  if (MI.getOpcode() == SASS::USETMAXREG_DEALLOC ||
+      MI.getOpcode() == SASS::USETMAXREG_TRY_ALLOC)
+    return MI.getOperand(MI.getNumDefs()).getImm();
+  return L;
+}
+
+/// Register count in effect at each block entry: \p Entry at the function
+/// entry, then the minimum over incoming paths.
+static DenseMap<const MachineBasicBlock *, unsigned>
+regLimitsIn(MachineFunction &MF, unsigned Entry) {
+  DenseMap<const MachineBasicBlock *, unsigned> In, Out;
+  ReversePostOrderTraversal<MachineFunction *> RPOT(&MF);
+  for (bool Changed = true; Changed;) {
+    Changed = false;
+    for (MachineBasicBlock *B : RPOT) {
+      unsigned L = B == &MF.front() ? Entry : ~0u;
+      for (MachineBasicBlock *P : B->predecessors())
+        if (auto It = Out.find(P); It != Out.end())
+          L = std::min(L, It->second);
+      In[B] = L;
+      for (const MachineInstr &MI : *B)
+        L = limitAfter(MI, L);
+      auto [It, New] = Out.try_emplace(B, L);
+      if (New || It->second != L) {
+        It->second = L;
+        Changed = true;
+      }
+    }
+  }
+  return In;
+}
+
+bool SASSRegisterInfo::getRegAllocationHints(
+    Register VirtReg, ArrayRef<MCPhysReg> Order,
+    SmallVectorImpl<MCPhysReg> &Hints, const MachineFunction &MF,
+    const VirtRegMap *VRM, const LiveRegMatrix *Matrix) const {
+  bool Hard = TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints,
+                                                        MF, VRM, Matrix);
+  const auto &Limits = MF.getInfo<SASSFunctionInfo>()->RegLimit;
+  if (Limits.empty())
+    return Hard;
+  unsigned L = ~0u;
+  for (const MachineInstr &MI : MF.getRegInfo().reg_nodbg_instructions(VirtReg))
+    if (auto It = Limits.find(MI.getParent()); It != Limits.end())
+      L = std::min(L, It->second);
+  if (L == ~0u)
+    return Hard;
+  // Only registers whose 32-bit lanes all lie below L - 2.
+  auto Fits = [&](MCPhysReg R) {
+    for (MCRegUnit U : regunits(R))
+      for (MCRegUnitRootIterator Root(U, this); Root.isValid(); ++Root)
+        if (SASS::GPR32RegClass.contains(*Root) && getEncodingValue(*Root) + 3 > L)
+          return false;
+    return true;
+  };
+  SmallVector<MCPhysReg, 16> Pref(Hints.begin(), Hints.end());
+  Hints.clear();
+  for (MCPhysReg R : Pref)
+    if (Fits(R) && is_contained(Order, R))
+      Hints.push_back(R);
+  for (MCPhysReg R : Order)
+    if (Fits(R) && !is_contained(Hints, R))
+      Hints.push_back(R);
+  return true;
+}
 
 //===----------------------------------------------------------------------===//
 // SASSExpandWGMMA
@@ -489,16 +560,17 @@ void SASSExpandWGMMA::expandWGMMA(MachineInstr &MI) {
                                  : (Flags & ~0x3fu) | (Part ? (N - 128) / 8 : 16);
     Register BLo = Part ? AdvanceB() : ToUR(B, SASS::sub0);
     Register DescR;
+    // {A desc, B desc}; the RS form leaves the A half undefined.
     if (RS) {
-      DescR = vreg(&SASS::UGPR64A4RegClass);
-      BuildMI(MBB, MI, DL, TII->get(TargetOpcode::REG_SEQUENCE), DescR)
-          .addReg(BLo).addImm(SASS::sub0).addReg(BHi).addImm(SASS::sub1);
-    } else {
-      DescR = vreg(&SASS::UGPR128RegClass);
-      BuildMI(MBB, MI, DL, TII->get(TargetOpcode::REG_SEQUENCE), DescR)
-          .addReg(AUR0).addImm(SASS::sub0).addReg(AUR1).addImm(SASS::sub1)
-          .addReg(BLo).addImm(SASS::sub2).addReg(BHi).addImm(SASS::sub3);
+      AUR0 = vreg(&SASS::UGPR32RegClass);
+      AUR1 = vreg(&SASS::UGPR32RegClass);
+      BuildMI(MBB, MI, DL, TII->get(TargetOpcode::IMPLICIT_DEF), AUR0);
+      BuildMI(MBB, MI, DL, TII->get(TargetOpcode::IMPLICIT_DEF), AUR1);
     }
+    DescR = vreg(&SASS::UGPR128RegClass);
+    BuildMI(MBB, MI, DL, TII->get(TargetOpcode::REG_SEQUENCE), DescR)
+        .addReg(AUR0).addImm(SASS::sub0).addReg(AUR1).addImm(SASS::sub1)
+        .addReg(BLo).addImm(SASS::sub2).addReg(BHi).addImm(SASS::sub3);
     const TargetRegisterClass *RC = accClass(Cnt);
     unsigned Lanes = TRI->getRegSizeInBits(*RC) / 32;
     Register In;
@@ -620,6 +692,20 @@ bool SASSExpandWGMMA::runOnMachineFunction(MachineFunction &MF) {
       expandWGMMA(*MI);
     else
       expandSetMaxNReg(*MI);
+  }
+  // Blocks where fewer registers than the function may use are available.
+  auto *FI = MF.getInfo<SASSFunctionInfo>();
+  FI->RegLimit.clear();
+  if (unsigned Entry = SASS::setMaxRegEntryCount(MF)) {
+    unsigned Max = SASS::setMaxRegLimit(MF);
+    auto In = regLimitsIn(MF, Entry);
+    for (MachineBasicBlock &B : MF) {
+      unsigned L = In.lookup(&B), Min = L;
+      for (const MachineInstr &MI : B)
+        Min = std::min(Min, L = limitAfter(MI, L));
+      if (Min < Max)
+        FI->RegLimit[&B] = Min;
+    }
   }
   return !Work.empty();
 }
@@ -782,50 +868,31 @@ void SASSWGMMAHazards::checkSetMaxReg(MachineFunction &MF) {
   unsigned Entry = SASS::setMaxRegEntryCount(MF);
   if (!Entry)
     return;
-  // Register count in effect: the minimum over incoming paths.
-  DenseMap<const MachineBasicBlock *, unsigned> In, Out;
-  ReversePostOrderTraversal<MachineFunction *> RPOT(&MF);
-  auto Transfer = [&](MachineBasicBlock &B, unsigned L, bool Check) {
+  auto In = regLimitsIn(MF, Entry);
+  for (MachineBasicBlock &B : MF) {
+    unsigned L = In.lookup(&B);
     for (MachineInstr &MI : B) {
-      if (Check)
-        for (const MachineOperand &MO : MI.operands()) {
-          if (!MO.isReg() || !MO.getReg().isPhysical())
-            continue;
-          for (MCRegUnit U : TRI->regunits(MO.getReg()))
-            for (MCRegUnitRootIterator R(U, TRI); R.isValid(); ++R)
-              if (SASS::GPR32RegClass.contains(*R) && *R != SASS::RZ &&
-                  TRI->getEncodingValue(*R) + 3 > L)
-                report_fatal_error(
-                    "SASS: " + MF.getName() + ": R" +
-                    Twine(TRI->getEncodingValue(*R)) +
-                    " is used where setmaxnreg limits the warp to " + Twine(L) +
-                    " registers (the top two are reserved); the register "
-                    "allocator does not model setmaxnreg regions");
-        }
-      if (MI.getOpcode() == SASS::USETMAXREG_DEALLOC ||
-          MI.getOpcode() == SASS::USETMAXREG_TRY_ALLOC)
-        L = MI.getOperand(MI.getNumDefs()).getImm();
-    }
-    return L;
-  };
-  for (bool Changed = true; Changed;) {
-    Changed = false;
-    for (MachineBasicBlock *B : RPOT) {
-      unsigned L = B == &MF.front() ? Entry : ~0u;
-      for (MachineBasicBlock *P : B->predecessors())
-        if (auto It = Out.find(P); It != Out.end())
-          L = std::min(L, It->second);
-      In[B] = L;
-      unsigned O = Transfer(*B, L, false);
-      auto [It, New] = Out.try_emplace(B, O);
-      if (New || It->second != O) {
-        It->second = O;
-        Changed = true;
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg() || !MO.getReg().isPhysical())
+          continue;
+        for (MCRegUnit U : TRI->regunits(MO.getReg()))
+          for (MCRegUnitRootIterator R(U, TRI); R.isValid(); ++R) {
+            if (!SASS::GPR32RegClass.contains(*R) || *R == SASS::RZ ||
+                TRI->getEncodingValue(*R) + 3 <= L)
+              continue;
+            std::string S;
+            raw_string_ostream OS(S);
+            MI.print(OS, /*IsStandalone=*/true, /*SkipOpers=*/false,
+                     /*SkipDebugLoc=*/true);
+            report_fatal_error("SASS: " + MF.getName() + ": R" +
+                               Twine(TRI->getEncodingValue(*R)) +
+                               " is used where setmaxnreg limits the warp to " +
+                               Twine(L) + " registers (the top two are reserved): " + S);
+          }
       }
+      L = limitAfter(MI, L);
     }
   }
-  for (MachineBasicBlock *B : RPOT)
-    Transfer(*B, In[B], true);
 }
 
 bool SASSWGMMAHazards::runOnMachineFunction(MachineFunction &MF) {
@@ -905,5 +972,14 @@ bool SASSWGMMAHazards::runOnMachineFunction(MachineFunction &MF) {
   for (MachineBasicBlock *B : RPOT)
     if (auto It = In.find(B); It != In.end())
       process(*B, It->second, true);
+  // wgmma is .sync.aligned, but nothing reconverges the warp after divergent
+  // code (a guarded shared-memory fill): WARPSYNC.ALL before each arrive,
+  // which precedes every GMMA group (diverged GMMAs fault on the H100).
+  for (MachineBasicBlock &B : MF)
+    for (MachineInstr &MI : B)
+      if (MI.getOpcode() == SASS::WARPGROUP_ARRIVE &&
+          (MI.getIterator() == B.begin() ||
+           std::prev(MI.getIterator())->getOpcode() != SASS::WARPSYNC_ALL))
+        noGuard(BuildMI(B, MI, MI.getDebugLoc(), TII->get(SASS::WARPSYNC_ALL)));
   return true;
 }

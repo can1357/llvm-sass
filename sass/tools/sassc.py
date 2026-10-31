@@ -20,10 +20,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]  # sass/ in the llvm-project tree
+# The root of an llvm-sass overlay checkout (build in ./build) or sass/ of the
+# llvm-project tree (build in ../build).
+ROOT = Path(__file__).resolve().parents[1]
+BUILD = next((d for d in (ROOT / "build", ROOT.parent / "build") if (d / "bin" / "llc").exists()),
+             ROOT.parent / "build")
 # A clang with the NVPTX target (CUDA device-side frontend); Apple's lacks it.
 CLANG = os.environ.get("CLANG", "/opt/homebrew/opt/llvm/bin/clang")
-LLC = Path(os.environ.get("LLC", ROOT.parent / "build" / "bin" / "llc"))
+LLC = Path(os.environ.get("LLC", BUILD / "bin" / "llc"))
 sys.path.insert(0, str(ROOT / "sass-dec"))
 
 
@@ -78,9 +82,11 @@ def main() -> int:
     if opts.src.suffix == ".cu":
         ll = opts.out / f"{stem}.ll"
         # Without a CUDA install clang cannot infer the PTX ISA version, which
-        # gates builtins such as __nvvm_shfl_sync_*.
+        # gates builtins such as __nvvm_shfl_sync_*. bf16 arithmetic stays in
+        # bf16 (no excess float precision), as nvcc rounds each operation.
         run([CLANG, "-x", "cuda", "--cuda-device-only", "-nocudainc", "-nocudalib",
              f"--cuda-gpu-arch={gpu_arch}", "-Xclang", "-target-feature", "-Xclang", "+ptx87",
+             "-Xclang", "-fbfloat16-excess-precision=none",
              "-fcuda-short-ptr", "-O3", "-S", "-emit-llvm", *FAST_MATH * opts.fast_math,
              "-include", str(ROOT / "kernels" / "cuda_min.h"), str(opts.src), "-o", str(ll)])
     sass_path = opts.out / f"{stem}.sass"

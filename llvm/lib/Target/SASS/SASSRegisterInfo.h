@@ -23,6 +23,12 @@ public:
                            unsigned FIOperandNum,
                            RegScavenger *RS = nullptr) const override;
   Register getFrameRegister(const MachineFunction &MF) const override;
+  /// setmaxnreg: virtual registers referenced where a smaller register count
+  /// is in effect may only use registers below it (SASSWGMMA.cpp).
+  bool getRegAllocationHints(Register VirtReg, ArrayRef<MCPhysReg> Order,
+                             SmallVectorImpl<MCPhysReg> &Hints,
+                             const MachineFunction &MF, const VirtRegMap *VRM,
+                             const LiveRegMatrix *Matrix) const override;
 };
 
 } // namespace llvm

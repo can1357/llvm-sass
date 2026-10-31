@@ -32,6 +32,10 @@ public:
   /// parameters wider than 8 bytes; 0 for the implicit 4/8-byte slots.
   SmallVector<unsigned, 8> ParamAligns;
 
+  /// setmaxnreg: for each block where the warp's register count can be below
+  /// the function's maximum, the smallest count in effect in it
+  /// (SASSExpandWGMMA; honored by SASSRegisterInfo::getRegAllocationHints).
+  DenseMap<const MachineBasicBlock *, unsigned> RegLimit;
   /// Control words assigned by SASSControlCodes, read by SASSAsmPrinter.
   DenseMap<const MachineInstr *, SASSCtrl> Ctrl;
 };

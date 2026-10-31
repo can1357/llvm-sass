@@ -71,9 +71,17 @@ unsigned SASS::constBank(const MemSDNode &N) {
     }
     Bank = B;
   }
-  if (!Bank)
-    report_fatal_error("SASS: cannot tell which __constant__ variable or "
-                       "by-value kernel parameter a constant load reads");
+  if (!Bank) {
+    std::string What = "no IR pointer";
+    if (Ptr) {
+      raw_string_ostream OS(What = "");
+      Ptr->printAsOperand(OS, /*PrintType=*/false);
+    }
+    report_fatal_error(Twine("SASS: cannot tell which __constant__ variable "
+                             "or by-value kernel parameter a constant load "
+                             "reads (") +
+                       What + ")");
+  }
   return *Bank;
 }
 

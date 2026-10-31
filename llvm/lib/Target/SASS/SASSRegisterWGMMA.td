@@ -9,8 +9,8 @@
 //   LaneBitmask has 64 bits, so no tuple can have more than 64 32-bit
 //   lanes: f32 shapes with N > 128 are issued as two instructions
 //   (SASSWGMMA.cpp).
-// * Descriptors: a 4-aligned uniform quad (A and B descriptors, SS form) or
-//   a 4-aligned uniform pair (B descriptor, RS form).
+// * Descriptors: a 4-aligned uniform quad (A and B descriptors; the RS form
+//   reads B from the upper pair).
 // * Uniform predicates UP0-UP6 (UPT reads as true): runtime scale-d and the
 //   USETMAXREG.TRY_ALLOC result.
 //
@@ -42,9 +42,6 @@ foreach I = 0-14 in
 def UGPR128 : RegisterClass<"SASS", [untyped], 128, (sequence "URQ%u", 0, 14)> {
   let Size = 128;
 }
-// 4-aligned uniform pairs (RS-form B descriptor).
-def UGPR64A4 : RegisterClass<"SASS", [i64], 64,
-                             (decimate (sequence "URD%u", 0, 30), 2)>;
 
 foreach I = 0-6 in
   def UP#I : SASSReg<I, "UP"#I>;

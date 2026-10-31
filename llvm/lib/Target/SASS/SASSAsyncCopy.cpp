@@ -80,7 +80,9 @@ static unsigned addrSpace(const MachineInstr &MI) {
 
 static bool isAsyncCopy(unsigned Opc) {
   return Opc == SASS::LDGSTS128 || Opc == SASS::LDGSTS_CA32 ||
-         Opc == SASS::LDGSTS_CA64 || Opc == SASS::LDGSTS_CA128;
+         Opc == SASS::LDGSTS_CA64 || Opc == SASS::LDGSTS_CA128 ||
+         Opc == SASS::LDGSTS128_P || Opc == SASS::LDGSTS_CA32_P ||
+         Opc == SASS::LDGSTS_CA64_P || Opc == SASS::LDGSTS_CA128_P;
 }
 
 /// ptxas issues three predicated-off LDS ahead of the first LDGSTS of each

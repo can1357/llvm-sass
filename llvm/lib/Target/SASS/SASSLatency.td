@@ -56,3 +56,6 @@ defvar LAT_WARPGROUP = 53;
 defvar LAT_VOTEU = 54;
 defvar LAT_USETMAXREG = 55;
 defvar LAT_WARPSYNC = 56;
+defvar LAT_VOTE = 57;
+defvar LAT_ELECT = 58;
+defvar LAT_DFMA = 59;

@@ -66,9 +66,11 @@ struct __half_raw {
 struct __half2_raw {
   unsigned short x, y;
   __half2_raw() = default;
+  // Through the whole vector: clang's __builtin_bit_cast of an ext-vector
+  // element (h.y) reads element 0.
   SASS_INL_MEMBER __half2_raw(__half2 h)
-      : x(__builtin_bit_cast(unsigned short, h.x)),
-        y(__builtin_bit_cast(unsigned short, h.y)) {}
+      : x((unsigned short)__builtin_bit_cast(unsigned, h)),
+        y((unsigned short)(__builtin_bit_cast(unsigned, h) >> 16)) {}
   SASS_INL_MEMBER operator __half2() const {
     return __builtin_bit_cast(__half2, *this);
   }
@@ -86,8 +88,8 @@ struct __nv_bfloat162_raw {
   unsigned short x, y;
   __nv_bfloat162_raw() = default;
   SASS_INL_MEMBER __nv_bfloat162_raw(__nv_bfloat162 h)
-      : x(__builtin_bit_cast(unsigned short, h.x)),
-        y(__builtin_bit_cast(unsigned short, h.y)) {}
+      : x((unsigned short)__builtin_bit_cast(unsigned, h)),
+        y((unsigned short)(__builtin_bit_cast(unsigned, h) >> 16)) {}
   SASS_INL_MEMBER operator __nv_bfloat162() const {
     return __builtin_bit_cast(__nv_bfloat162, *this);
   }
@@ -574,6 +576,18 @@ SASS_INL unsigned __match_any_sync(unsigned mask, unsigned long long v) {
   return __nvvm_match_any_sync_i64(mask, v);
 }
 SASS_INL unsigned __match_any_sync(unsigned mask, long long v) { return __nvvm_match_any_sync_i64(mask, v); }
+SASS_INL unsigned __match_all_sync(unsigned mask, unsigned v, int *pred) {
+  return __nvvm_match_all_sync_i32p(mask, v, pred);
+}
+SASS_INL unsigned __match_all_sync(unsigned mask, int v, int *pred) {
+  return __nvvm_match_all_sync_i32p(mask, v, pred);
+}
+SASS_INL unsigned __match_all_sync(unsigned mask, unsigned long long v, int *pred) {
+  return __nvvm_match_all_sync_i64p(mask, v, pred);
+}
+SASS_INL unsigned __match_all_sync(unsigned mask, long long v, int *pred) {
+  return __nvvm_match_all_sync_i64p(mask, v, pred);
+}
 SASS_INL unsigned __reduce_add_sync(unsigned mask, unsigned v) { return __nvvm_redux_sync_add(v, mask); }
 SASS_INL int __reduce_add_sync(unsigned mask, int v) { return __nvvm_redux_sync_add(v, mask); }
 SASS_INL unsigned __reduce_min_sync(unsigned mask, unsigned v) { return __nvvm_redux_sync_umin(v, mask); }
@@ -634,10 +648,8 @@ SASS_SHFL_API(__shfl_sync, idx, int)
 SASS_SHFL_API(__shfl_up_sync, up, unsigned)
 SASS_SHFL_API(__shfl_down_sync, down, unsigned)
 #undef SASS_SHFL_API
-// cuda_min.h has the 3-argument float/int butterflies; these add widths
-// and the remaining types.
-SASS_INL int __shfl_xor_sync(unsigned m, int v, int l, int w) { return __shfl_bfly_i(m, v, l, w); }
-SASS_INL float __shfl_xor_sync(unsigned m, float v, int l, int w) { return __shfl_bfly_f(m, v, l, w); }
+SASS_INL int __shfl_xor_sync(unsigned m, int v, int l, int w = 32) { return __shfl_bfly_i(m, v, l, w); }
+SASS_INL float __shfl_xor_sync(unsigned m, float v, int l, int w = 32) { return __shfl_bfly_f(m, v, l, w); }
 SASS_INL unsigned __shfl_xor_sync(unsigned m, unsigned v, int l, int w = 32) {
   return (unsigned)__shfl_bfly_i(m, (int)v, l, w);
 }

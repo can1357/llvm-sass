@@ -268,12 +268,41 @@ bool SASSLowerInlinePTX::runOnFunction(Function &F) {
       Define(Ops[0], Results(B.CreateCall(Fn, Args), 4));
     } else if (std::regex_match(Opc, Mt, std::regex(
                    "cp\\.async\\.(ca|cg)\\.shared\\.global(\\.L2::(64|128|256)B)?"))) {
-      if (Ops.size() != 3 || !Ops[0].IsAddr || !Ops[1].IsAddr)
+      if ((Ops.size() != 3 && Ops.size() != 4) || !Ops[0].IsAddr || !Ops[1].IsAddr)
         Fail();
-      int64_t Size = Ops[2].Imm ? *Ops[2].Imm : -1;
-      if (!Ops[2].Imm && Ops[2].Refs.size() == 1)
-        if (auto *C = dyn_cast<ConstantInt>(Call.src(Ops[2].Refs[0])))
-          Size = C->getSExtValue();
+      auto ConstOp = [&](const Operand &O) -> std::optional<int64_t> {
+        if (O.Imm)
+          return *O.Imm;
+        if (O.Refs.size() == 1)
+          if (auto *C = dyn_cast<ConstantInt>(Call.src(O.Refs[0])))
+            return C->getSExtValue();
+        return std::nullopt;
+      };
+      int64_t Size = ConstOp(Ops[2]).value_or(-1);
+      // src-size: the copy size (a plain copy), 0 (zero-fill) or a select
+      // between the two; ptxas turns the latter two into LDGSTS's source
+      // predicate. Other sizes would need its .ZFILL form.
+      Value *SrcSize = nullptr;
+      if (Ops.size() == 4) {
+        std::optional<int64_t> S = ConstOp(Ops[3]);
+        if (!S && Ops[3].Refs.size() == 1) {
+          Value *V = Call.src(Ops[3].Refs[0]);
+          while (isa<ZExtInst, SExtInst, TruncInst>(V))
+            V = cast<Instruction>(V)->getOperand(0);
+          auto *Sel = dyn_cast<SelectInst>(V);
+          auto *T = Sel ? dyn_cast<ConstantInt>(Sel->getTrueValue()) : nullptr;
+          auto *F = Sel ? dyn_cast<ConstantInt>(Sel->getFalseValue()) : nullptr;
+          if (!T || !F || !((T->equalsInt(Size) && F->isZero()) ||
+                            (T->isZero() && F->equalsInt(Size))))
+            Fail();
+          SrcSize = B.CreateSelect(Sel->getCondition(), B.getInt32(T->getZExtValue()),
+                                   B.getInt32(F->getZExtValue()));
+        } else if (S && *S == 0) {
+          SrcSize = B.getInt32(0);
+        } else if (!S || *S != Size) {
+          Fail();
+        }
+      }
       Intrinsic::ID IID =
           Mt[1] == "cg" ? (Size == 16 ? Intrinsic::nvvm_cp_async_cg_shared_global_16
                                       : Intrinsic::not_intrinsic)
@@ -283,9 +312,20 @@ bool SASSLowerInlinePTX::runOnFunction(Function &F) {
                         : Intrinsic::not_intrinsic;
       if (IID == Intrinsic::not_intrinsic)
         Fail();
-      B.CreateCall(Intrinsic::getOrInsertDeclaration(&M, IID),
-                   {address(B, Call.src(Ops[0].Refs[0]), Ops[0].Offset, 3),
-                    address(B, Call.src(Ops[1].Refs[0]), Ops[1].Offset, 1)});
+      SmallVector<Value *, 3> Args = {
+          address(B, Call.src(Ops[0].Refs[0]), Ops[0].Offset, 3),
+          address(B, Call.src(Ops[1].Refs[0]), Ops[1].Offset, 1)};
+      if (SrcSize) {
+        IID = IID == Intrinsic::nvvm_cp_async_cg_shared_global_16
+                  ? Intrinsic::nvvm_cp_async_cg_shared_global_16_s
+              : IID == Intrinsic::nvvm_cp_async_ca_shared_global_16
+                  ? Intrinsic::nvvm_cp_async_ca_shared_global_16_s
+              : IID == Intrinsic::nvvm_cp_async_ca_shared_global_8
+                  ? Intrinsic::nvvm_cp_async_ca_shared_global_8_s
+                  : Intrinsic::nvvm_cp_async_ca_shared_global_4_s;
+        Args.push_back(SrcSize);
+      }
+      B.CreateCall(Intrinsic::getOrInsertDeclaration(&M, IID), Args);
     } else if (Opc == "cp.async.commit_group" && Ops.empty()) {
       B.CreateCall(Intrinsic::getOrInsertDeclaration(&M, Intrinsic::nvvm_cp_async_commit_group));
     } else if (Opc == "cp.async.wait_all" && Ops.empty()) {

@@ -4,8 +4,10 @@
 #include "SASSSelectionDAGInfo.h"
 #include "SASSSubtarget.h"
 #include "SASSTargetMachine.h"
+#include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
+#include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -51,6 +53,8 @@ private:
   /// Read by the generated pattern predicates (HasBlackwellISA, ...).
   const SASSSubtarget *Subtarget = nullptr;
 
+  /// BRCOND of a block whose IR terminator is warp-uniform -> BRAcu.
+  bool selectUniformBranch(SDNode *N);
   void selectVectorLoad(SDNode *N);
   void selectVectorStore(SDNode *N);
   /// Tensor-core, matrix and async-copy intrinsics; false if \p N is
@@ -72,6 +76,12 @@ public:
   static char ID;
   SASSDAGToDAGISelLegacy(SASSTargetMachine &TM, CodeGenOptLevel OL)
       : SelectionDAGISelLegacy(ID, std::make_unique<SASSDAGToDAGISel>(TM, OL)) {}
+
+  // Branch uniformity for SASSReconverge.
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<UniformityInfoWrapperPass>();
+    SelectionDAGISelLegacy::getAnalysisUsage(AU);
+  }
 };
 
 } // namespace
@@ -112,13 +122,38 @@ void SASSDAGToDAGISel::Select(SDNode *N) {
   case ISD::INTRINSIC_WO_CHAIN:
   case ISD::INTRINSIC_W_CHAIN:
   case ISD::INTRINSIC_VOID:
-    if (selectIntrinsic(N) || SASS::selectPTXIntrinsic(*CurDAG, N))
+    if (selectIntrinsic(N) || SASS::selectPTXIntrinsic(*CurDAG, N) ||
+        SASS::selectWarpIntrinsic(*CurDAG, N))
+      return;
+    break;
+  case ISD::BRCOND:
+    if (selectUniformBranch(N))
       return;
     break;
   default:
     break;
   }
   SelectCode(N);
+}
+
+bool SASSDAGToDAGISel::selectUniformBranch(SDNode *N) {
+  auto *UA = const_cast<UniformityInfo *>(CurDAG->getUniformityInfo());
+  const BasicBlock *BB = FuncInfo->MBB->getBasicBlock();
+  if (!UA || !BB || !SASS::reconverges(*Subtarget) ||
+      UA->hasDivergentTerminator(*BB))
+    return false;
+  SDValue Cond = N->getOperand(1);
+  unsigned Neg = 0;
+  if (Cond.getOpcode() == ISD::XOR && isAllOnesConstant(Cond.getOperand(1))) {
+    Cond = Cond.getOperand(0);
+    Neg = 1;
+  }
+  SDLoc DL(N);
+  SDValue Ops[] = {N->getOperand(2), Cond,
+                   CurDAG->getTargetConstant(Neg, DL, MVT::i32),
+                   N->getOperand(0)};
+  CurDAG->SelectNodeTo(N, SASS::BRAcu, MVT::Other, Ops);
+  return true;
 }
 
 bool SASSDAGToDAGISel::selectIntrinsic(SDNode *N) {
@@ -170,6 +205,18 @@ bool SASSDAGToDAGISel::selectIntrinsic(SDNode *N) {
     return true;
   case Intrinsic::nvvm_cp_async_cg_shared_global_16:
     selectAsyncCopy(N, SASS::LDGSTS128);
+    return true;
+  case Intrinsic::nvvm_cp_async_cg_shared_global_16_s:
+    selectAsyncCopy(N, SASS::LDGSTS128_P);
+    return true;
+  case Intrinsic::nvvm_cp_async_ca_shared_global_16_s:
+    selectAsyncCopy(N, SASS::LDGSTS_CA128_P);
+    return true;
+  case Intrinsic::nvvm_cp_async_ca_shared_global_8_s:
+    selectAsyncCopy(N, SASS::LDGSTS_CA64_P);
+    return true;
+  case Intrinsic::nvvm_cp_async_ca_shared_global_4_s:
+    selectAsyncCopy(N, SASS::LDGSTS_CA32_P);
     return true;
   case Intrinsic::nvvm_cp_async_ca_shared_global_16:
     selectAsyncCopy(N, SASS::LDGSTS_CA128);
@@ -281,8 +328,28 @@ void SASSDAGToDAGISel::selectAsyncCopy(SDNode *N, unsigned Opc) {
     GBase = N->getOperand(3);
     GOff = CurDAG->getTargetConstant(0, DL, MVT::i32);
   }
-  SDValue Ops[] = {SBase, SOff, GBase, GOff, guard(DL),
-                   CurDAG->getTargetConstant(0, DL, MVT::i32), N->getOperand(0)};
+  SmallVector<SDValue, 9> Ops = {SBase, SOff, GBase, GOff};
+  if (N->getNumOperands() > 4) {
+    // _s forms: SASSLowerInlinePTX only emits a src-size of 0 or the copy
+    // size, so the source is read iff it is non-zero.
+    SDValue Size = N->getOperand(4);
+    if (auto *C = dyn_cast<ConstantSDNode>(Size)) {
+      Ops.push_back(CurDAG->getRegister(SASS::PT, MVT::i1));
+      Ops.push_back(CurDAG->getTargetConstant(C->isZero(), DL, MVT::i32));
+    } else {
+      SDValue Pt = CurDAG->getRegister(SASS::PT, MVT::i1);
+      SDValue Zero = CurDAG->getTargetConstant(0, DL, MVT::i32);
+      Ops.push_back(SDValue(
+          CurDAG->getMachineNode(SASS::ISETPri, DL, MVT::i1,
+                                 {Size, Zero,
+                                  CurDAG->getTargetConstant(5, DL, MVT::i32),
+                                  Pt, Zero, guard(DL), Zero}),
+          0));
+      Ops.push_back(Zero);
+    }
+  }
+  Ops.append({guard(DL), CurDAG->getTargetConstant(0, DL, MVT::i32),
+              N->getOperand(0)});
   MachineSDNode *Cp = CurDAG->getMachineNode(Opc, DL, MVT::Other, Ops);
   CurDAG->setNodeMemRefs(Cp, {cast<MemSDNode>(N)->getMemOperand()});
   ReplaceNode(N, Cp);

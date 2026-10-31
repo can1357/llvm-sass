@@ -24,6 +24,8 @@ SASSTargetLowering::SASSTargetLowering(const TargetMachine &TM,
   addRegisterClass(MVT::i32, &SASS::GPR32RegClass);
   addRegisterClass(MVT::f32, &SASS::GPR32RegClass);
   addRegisterClass(MVT::i64, &SASS::GPR64RegClass);
+  // f64: conversions and DADD/DMUL/DFMA/DSETP (initConvActions).
+  addRegisterClass(MVT::f64, &SASS::GPR64RegClass);
   // Halves live in 32-bit registers: scalars in the low 16 bits, packed
   // pairs in the whole register (operation actions: initTypeActions).
   for (MVT VT : {MVT::v2f16, MVT::v2bf16, MVT::f16, MVT::bf16})
@@ -107,19 +109,36 @@ SASSTargetLowering::SASSTargetLowering(const TargetMachine &TM,
   setTargetDAGCombine(ISD::ADD);
   initTypeActions();
   initPTXActions();
+  initConvActions();
 }
 
-/// Walks the module's static shared variables in order; returns the offset of
-/// \p Stop, or the total size when \p Stop is null. Every extern __shared__
-/// array is the dynamic window right after the static variables, aligned
-/// like ptxas to at least 16 bytes and to the strictest extern declaration;
-/// when there is one, the total is padded to that base.
-static uint64_t sharedLayout(const Module &M, const GlobalVariable *Stop) {
+/// Whether kernel \p F refers to \p G (device functions are inlined into
+/// their kernels by then, so every use is in a kernel or a constant).
+static bool usedBy(const Value &G, const Function &F) {
+  for (const User *U : G.users()) {
+    if (const auto *I = dyn_cast<Instruction>(U)) {
+      if (I->getFunction() == &F)
+        return true;
+    } else if (isa<Constant>(U) && usedBy(*U, F)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Walks the static shared variables kernel \p F uses, in module order;
+/// returns the offset of \p Stop, or the total size when \p Stop is null.
+/// Every extern __shared__ array is the dynamic window right after the
+/// static variables, aligned like ptxas to at least 16 bytes and to the
+/// strictest extern declaration; when there is one, the total is padded to
+/// that base.
+static uint64_t sharedLayout(const Function &F, const GlobalVariable *Stop) {
+  const Module &M = *F.getParent();
   const DataLayout &DL = M.getDataLayout();
   uint64_t Off = 0;
   std::optional<Align> DynAlign;
   for (const GlobalVariable &G : M.globals()) {
-    if (G.getAddressSpace() != 3)
+    if (G.getAddressSpace() != 3 || (&G != Stop && !usedBy(G, F)))
       continue;
     Align A = G.getAlign().value_or(DL.getPrefTypeAlign(G.getValueType()));
     if (G.isDeclaration()) {
@@ -140,17 +159,19 @@ static uint64_t sharedLayout(const Module &M, const GlobalVariable *Stop) {
   return Off;
 }
 
-bool SASS::hasDynamicShared(const Module &M) {
-  return any_of(M.globals(), [](const GlobalVariable &G) {
-    return G.getAddressSpace() == 3 && G.isDeclaration();
+bool SASS::hasDynamicShared(const Function &F) {
+  return any_of(F.getParent()->globals(), [&](const GlobalVariable &G) {
+    return G.getAddressSpace() == 3 && G.isDeclaration() && usedBy(G, F);
   });
 }
 
-uint64_t SASS::sharedOffset(const GlobalVariable &GV) {
-  return sharedLayout(*GV.getParent(), &GV);
+uint64_t SASS::sharedOffset(const GlobalVariable &GV, const Function &F) {
+  return sharedLayout(F, &GV);
 }
 
-uint64_t SASS::sharedBytes(const Module &M) { return sharedLayout(M, nullptr); }
+uint64_t SASS::sharedBytes(const Function &F) {
+  return sharedLayout(F, nullptr);
+}
 
 /// Vector accesses done as one LDG/LDS/LDL/LD.64/.128: 2 or 4 x 32-bit elements,
 /// naturally aligned.
@@ -237,15 +258,28 @@ SDValue SASSTargetLowering::lowerGlobalAddress(SDValue Op,
   SDValue Base = DAG.getNode(SASSISD::SMEM_BASE, DL, MVT::i32);
   return DAG.getNode(
       ISD::ADD, DL, MVT::i32, Base,
-      DAG.getConstant(SASS::sharedOffset(*GV) + GA->getOffset(), DL, MVT::i32));
+      DAG.getConstant(SASS::sharedOffset(*GV, DAG.getMachineFunction().getFunction()) +
+                          GA->getOffset(),
+                      DL, MVT::i32));
 }
 
 SDValue SASSTargetLowering::lowerConstAddrSpaceCast(SDValue Op,
-                                                    SelectionDAG &) const {
+                                                    SelectionDAG &DAG) const {
   auto *ASC = cast<AddrSpaceCastSDNode>(Op);
-  if (ASC->getSrcAddressSpace() == 4 || ASC->getDestAddressSpace() == 4)
+  unsigned Src = ASC->getSrcAddressSpace(), Dst = ASC->getDestAddressSpace();
+  if (Src == 4 || Dst == 4)
     report_fatal_error("SASS: generic pointers to __constant__ memory are not "
                        "supported (only direct __constant__ accesses)");
+  // As ptxas's cvta.shared / cvta.to.shared: a generic shared address is the
+  // 32-bit shared address under the shared window's high word (SR_SWINHI).
+  SDLoc DL(Op);
+  SDValue Ptr = Op.getOperand(0);
+  if (Src == 3 && Dst == 0)
+    return DAG.getNode(SASSISD::PAIR, DL, MVT::i64,
+                       DAG.getZExtOrTrunc(Ptr, DL, MVT::i32),
+                       DAG.getNode(SASSISD::SWINHI, DL, MVT::i32));
+  if (Src == 0 && Dst == 3)
+    return DAG.getZExtOrTrunc(Ptr, DL, Op.getValueType());
   return Op;
 }
 
@@ -363,6 +397,10 @@ void SASSTargetLowering::getTgtMemIntrinsic(
   case Intrinsic::nvvm_cp_async_ca_shared_global_16:
   case Intrinsic::nvvm_cp_async_ca_shared_global_8:
   case Intrinsic::nvvm_cp_async_ca_shared_global_4:
+  case Intrinsic::nvvm_cp_async_cg_shared_global_16_s:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_16_s:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_8_s:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_4_s:
     // The shared-memory write: ordering against other shared accesses
     // comes from the explicit commit/wait (DEPBAR) the program issues.
     Info.opc = ISD::INTRINSIC_VOID;
@@ -433,7 +471,7 @@ SDValue SASSTargetLowering::LowerFormalArguments(
         ParamBase + Slots[In.getOrigArgIndex()].Offset + In.PartOffset;
     SDValue OffV = DAG.getTargetConstant(CBOff, DL, MVT::i32);
     EVT ArgVT = In.ArgVT;
-    if (In.VT == MVT::i64 || In.VT == MVT::f32) {
+    if (In.VT == MVT::i64 || In.VT == MVT::f32 || In.VT == MVT::f64) {
       InVals.push_back(DAG.getNode(SASSISD::LDC, DL, In.VT, OffV));
       continue;
     }
@@ -466,7 +504,9 @@ SDValue SASSTargetLowering::LowerReturn(
 }
 
 SDValue SASSTargetLowering::LowerCall(CallLoweringInfo &CLI,
-                                      SmallVectorImpl<SDValue> &) const {
+                                      SmallVectorImpl<SDValue> &InVals) const {
+  if (SDValue Chain = lowerBuiltinCall(CLI, InVals))
+    return Chain;
   std::string Callee = "<indirect>";
   if (auto *G = dyn_cast<GlobalAddressSDNode>(CLI.Callee))
     Callee = G->getGlobal()->getName().str();

@@ -18,14 +18,34 @@ using namespace llvm;
 #include "SASSGenRegisterInfo.inc"
 
 unsigned llvm::SASS::maxRegCount(const Function &F) {
-  uint64_t Threads = F.getFnAttributeAsParsedInteger("nvvm.maxntid", 0);
-  uint64_t Blocks = F.getFnAttributeAsParsedInteger("nvvm.minctasm", 0);
-  if (!Threads || !Blocks)
-    return 255;
-  // Registers are allocated per warp in units of 256 (8 per thread).
-  uint64_t Warps = divideCeil(Threads, 32);
-  uint64_t PerThread = 65536 / (Blocks * Warps * 32) / 8 * 8;
-  return std::clamp<uint64_t>(PerThread, 8, 255);
+  // "nvvm.maxntid" is "x[,y[,z]]"; its product is the block size.
+  uint64_t Threads = 0;
+  if (Attribute A = F.getFnAttribute("nvvm.maxntid"); A.isStringAttribute()) {
+    Threads = 1;
+    SmallVector<StringRef, 3> Dims;
+    A.getValueAsString().split(Dims, ',');
+    for (StringRef D : Dims) {
+      uint64_t N;
+      if (D.trim().getAsInteger(10, N) || !N)
+        report_fatal_error("SASS: " + F.getName() + ": malformed nvvm.maxntid");
+      Threads *= N;
+    }
+  }
+  uint64_t Limit = 255;
+  if (Threads) {
+    // As ptxas: without minBlocksPerSM, one block of maxThreads must fit.
+    uint64_t Blocks = F.getFnAttributeAsParsedInteger("nvvm.minctasm", 1);
+    // Each of the 4 SM sub-partitions owns 16K registers and its warps' share
+    // is allocated in units of 256 (8 per thread); a block's warps are spread
+    // over the sub-partitions, so the most loaded one holds
+    // ceil(Blocks * Warps / 4) of them.
+    uint64_t Warps = std::max<uint64_t>(Blocks, 1) * divideCeil(Threads, 32);
+    Limit = 16384 / (divideCeil(Warps, 4) * 32) / 8 * 8;
+  }
+  // __maxnreg__ / .maxnreg.
+  if (uint64_t N = F.getFnAttributeAsParsedInteger("nvvm.maxnreg", 0))
+    Limit = std::min(Limit, N);
+  return std::clamp<uint64_t>(Limit, 8, 255);
 }
 
 SASSRegisterInfo::SASSRegisterInfo() : SASSGenRegisterInfo(SASS::R1) {}
@@ -102,6 +122,38 @@ bool SASSRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
     Guard(MIB);
     MIB.cloneMemRefs(MI);
   };
+
+  // wgmma accumulator tuples: one STL.128/LDL.128 per 4-aligned quad.
+  bool IsGacc = false;
+  unsigned Opc = MI.getOpcode();
+#define GACC_CASE(S)                                                           \
+  IsGacc |= Opc == SASS::SPILL_GACC##S || Opc == SASS::RELOAD_GACC##S;
+  GACC_CASE(8) GACC_CASE(12) GACC_CASE(16) GACC_CASE(20) GACC_CASE(24)
+  GACC_CASE(28) GACC_CASE(32) GACC_CASE(36) GACC_CASE(40) GACC_CASE(44)
+  GACC_CASE(48) GACC_CASE(52) GACC_CASE(56) GACC_CASE(60) GACC_CASE(64)
+#undef GACC_CASE
+  if (IsGacc) {
+    bool IsStore = MI.mayStore();
+    const MachineOperand &RegOp = MI.getOperand(IsStore ? 2 : 0);
+    Register Tuple = RegOp.getReg();
+    unsigned First = getEncodingValue(getSubReg(Tuple, SASS::sub0));
+    unsigned Lanes = getRegSizeInBits(Tuple, MRI) / 32;
+    for (unsigned Q = 0; Q < Lanes; Q += 4) {
+      MCRegister Quad = getMatchingSuperReg(
+          SASS::GPR32RegClass.getRegister(First + Q), SASS::sub0,
+          &SASS::GPR128RegClass);
+      if (IsStore) {
+        auto MIB = Build(SASS::STL128).addReg(SASS::R1).addImm(Off + 4 * Q).addReg(
+            Quad, getKillRegState(RegOp.isKill()));
+        Guard(MIB);
+        MIB.cloneMemRefs(MI);
+      } else {
+        Load(SASS::LDL128, Quad, 4 * Q);
+      }
+    }
+    MI.eraseFromParent();
+    return true;
+  }
 
   switch (MI.getOpcode()) {
   case SASS::IADDri:

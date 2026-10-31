@@ -194,7 +194,7 @@ index 4bcb59d..1a36c6c 100644
  
      @staticmethod
 diff --git a/assembler/sass_depcheck.py b/assembler/sass_depcheck.py
-index c572094..f026498 100644
+index c572094..422e289 100644
 --- a/assembler/sass_depcheck.py
 +++ b/assembler/sass_depcheck.py
 @@ -111,9 +111,10 @@ class Claim:
@@ -209,7 +209,7 @@ index c572094..f026498 100644
  
      def __hash__(self):
          return hash((self.idx, self.kind, self.sb))
-@@ -296,6 +297,12 @@ def build_cfg(insts, infos, addrs):
+@@ -296,6 +297,21 @@ def build_cfg(insts, infos, addrs):
      targets = {}          # idx -> list of target idx (None for any-succ)
      ft = {}               # idx -> has fall-through
      bssy_stack = []       # (barReg, target_idx)
@@ -219,10 +219,19 @@ index c572094..f026498 100644
 +    index_at = {}
 +    for j in range(n):
 +        index_at.setdefault(addrs[j], j)
++    # BSYNC continues at its region's reconvergence point, which compilers place right after it. The listing-order
++    # stack below mispairs regions whose blocks are laid out out of line, so prefer the BSSY target that follows.
++    bssy_targets = set()
++    for i in range(n):
++        if infos[i] is not None and infos[i].mnemonic == "BSSY":
++            from .operand import OperandKind
++            for op in insts[i].operands:
++                if op.kind == OperandKind.IMM_S:
++                    bssy_targets.add(index_at.get(addrs[i] + 16 + op.value, n))
      for i in range(n):
          info = infos[i]
          if info is None:
-@@ -311,7 +318,7 @@ def build_cfg(insts, infos, addrs):
+@@ -311,18 +327,29 @@ def build_cfg(insts, infos, addrs):
              from .operand import OperandKind
              if op.kind == OperandKind.IMM_S:
                  target_addr = addrs[i] + 16 + op.value
@@ -231,7 +240,30 @@ index c572094..f026498 100644
          if mn == "BSSY":
              bssy_stack.append((insts[i].pred, tgt))
              ft[i] = True
-@@ -412,7 +419,21 @@ def build_cfg(insts, infos, addrs):
+         elif mn == "BSYNC":
+-            if bssy_stack:
++            after = index_at.get(addrs[i] + 16, n)
++            if after in bssy_targets:
++                tgt = after
++                if bssy_stack:
++                    bssy_stack.pop()
++            elif bssy_stack:
+                 _, tgt = bssy_stack.pop()
+             ft[i] = False
+         elif mn == "BREAK":
+             if bssy_stack:
+                 _, tgt = bssy_stack[-1]   # peek — BSYNC still needs it
+             ft[i] = False
++        elif mn == "BPT":
++            ft[i] = False                  # BPT.TRAP ends the kernel: no successor
++            targets[i] = []
++            if i + 1 < n:
++                is_leader[i + 1] = True
++            continue
+         elif info.branch_type == "BRT_CALL":
+             ft[i] = True                   # return point = next instruction
+         elif info.branch_type in _BRT_END:
+@@ -412,7 +439,21 @@ def build_cfg(insts, infos, addrs):
  # Dataflow + diagnostics
  # --------------------------------------------------------------------------
  def _kill_claims(claims: set, sb: int):
@@ -254,7 +286,7 @@ index c572094..f026498 100644
  
  
  def _register(claims: set, ub: dict, info: InstrInfo, track_count: bool):
-@@ -420,7 +441,9 @@ def _register(claims: set, ub: dict, info: InstrInfo, track_count: bool):
+@@ -420,7 +461,9 @@ def _register(claims: set, ub: dict, info: InstrInfo, track_count: bool):
      dataflow transfer and the diagnostic pass so both stay in sync."""
      if info.cls in _WR_CLASSES and info.defs and info.wr_sb != 7:
          claims.add(Claim(info.idx, 'wr', info.wr_sb, set(info.defs),
@@ -265,7 +297,7 @@ index c572094..f026498 100644
          if track_count:
              ub[info.wr_sb] = ub.get(info.wr_sb, 0) + 1
      if info.cls in _RD_CLASSES and info.rd_sb != 7:
-@@ -428,6 +451,14 @@ def _register(claims: set, ub: dict, info: InstrInfo, track_count: bool):
+@@ -428,6 +471,14 @@ def _register(claims: set, ub: dict, info: InstrInfo, track_count: bool):
                           info.predicated))
          if track_count:
              ub[info.rd_sb] = ub.get(info.rd_sb, 0) + 1
@@ -280,7 +312,7 @@ index c572094..f026498 100644
  
  
  class DepChecker:
-@@ -436,6 +467,7 @@ class DepChecker:
+@@ -436,6 +487,7 @@ class DepChecker:
          self.kernel_name = kernel_name
          self.diags: list[Diagnostic] = []
          self._track_count = False   # count lattice only when DEPBAR.LE cnt>0 present
@@ -288,7 +320,7 @@ index c572094..f026498 100644
  
      # -- fixpoint ----------------------------------------------------------
      def _block_transfer(self, block, infos, in_claims, in_ub):
-@@ -528,6 +560,13 @@ class DepChecker:
+@@ -528,6 +580,13 @@ class DepChecker:
              # ---- true-dependency: every use needs covering req ----
              for r in sorted(info.uses | info.guards):
                  for c in claims:
@@ -302,7 +334,7 @@ index c572094..f026498 100644
                      if c.kind == 'wr' and r in c.regs:
                          if c.sb not in info.req_bits:
                              self._warn(
-@@ -537,6 +576,17 @@ class DepChecker:
+@@ -537,6 +596,17 @@ class DepChecker:
                                  reg=_regname(r), sb=c.sb, prod=c.idx)
                          break   # one covering claim is enough
  
@@ -320,8 +352,26 @@ index c572094..f026498 100644
              # ---- anti-dependency: defs vs outstanding rd claims ----
              for r in sorted(info.defs | info.def_preds):
                  for c in claims:
-@@ -561,7 +611,8 @@ class DepChecker:
-                         f"is outstanding", sb=sb)
+@@ -550,18 +620,22 @@ class DepChecker:
+                         break
+ 
+             # ---- divergent re-targeting (predicated outstanding claim) ----
+-            for sb in (info.wr_sb, info.rd_sb):
++            # Read scoreboards shared by several in-flight sources (rd on rd, as
++            # ptxas shares one rd SB between stores) only make writers over-wait.
++            for sb, kind in ((info.wr_sb, 'wr'), (info.rd_sb, 'rd')):
+                 if sb == 7:
+                     continue
+-                if any(c.predicated for c in claims if c.sb == sb):
++                pred = [c for c in claims if c.sb == sb and c.predicated
++                        and not (kind == 'rd' and c.kind == 'rd')]
++                if pred:
+                     self._warn(
+                         i, "divergent_retarget",
+                         f"retargets SB{sb} while a predicated claim from "
+-                        f"inst {next(c.idx for c in claims if c.sb == sb and c.predicated)} "
+-                        f"is outstanding", sb=sb)
++                        f"inst {pred[0].idx} is outstanding", sb=sb)
  
              # ---- register claims ----
 -            if info.cls in _WR_CLASSES and info.defs and info.wr_sb == 7:
@@ -330,7 +380,7 @@ index c572094..f026498 100644
                  # missing_wr_sb: variable-latency result consumed later
                  if self._def_used_later(i, info.defs, infos):
                      self._warn(
-@@ -573,9 +624,13 @@ class DepChecker:
+@@ -573,9 +647,13 @@ class DepChecker:
  
              # ---- capacity (only meaningful when DEPBAR.LE partial drains
              # make the count lattice observable) ----
@@ -345,7 +395,7 @@ index c572094..f026498 100644
                          self._warn(i, "sb_capacity",
                                     f"SB{sb} in-flight upper bound {c} exceeds "
                                     f"the 6-bit tally cap without a drain", sb=sb)
-@@ -628,10 +683,10 @@ def run_depcheck(db: dict, insts, results, addrs, kernel_name="",
+@@ -628,10 +706,10 @@ def run_depcheck(db: dict, insts, results, addrs, kernel_name="",
          info.idx = i
          infos.append(info)
      checker = DepChecker(db, kernel_name)
@@ -361,7 +411,7 @@ index c572094..f026498 100644
      for d in diags:
          inst = insts[d.instr_idx]
 diff --git a/assembler/sass_elf.py b/assembler/sass_elf.py
-index acb221d..462780b 100644
+index acb221d..0586153 100644
 --- a/assembler/sass_elf.py
 +++ b/assembler/sass_elf.py
 @@ -301,8 +301,9 @@ class CubinBuilder:
@@ -403,7 +453,22 @@ index acb221d..462780b 100644
      def set_cluster_dims(self, dims: tuple[int, int, int] | None) -> None:
          """Cluster dimensions (x, y, z) → EIATTR_CTA_PER_CLUSTER + EXPLICIT
          cluster marker, so the driver accepts a cuLaunchKernelEx cluster
-@@ -466,7 +484,9 @@ class CubinBuilder:
+@@ -442,7 +460,13 @@ class CubinBuilder:
+             elif op == 0x19b1:                    # SYNCS.CCTL (per-addr)
+                 flags = 0x00000108 | (mbar_reg << 16)
+             if flags is not None:
+-                entries.append(struct.pack("<4I", i * 16, 0xff, 0, flags))
++                # u32 #2/#3: the address's vector register (Ra [31:24];
++                # RZ = 0xff for uniform forms and SYNCS.EXCH) and its
++                # immediate offset [63:40], as ptxas records them:
++                # PHASECHK P1, [R5+URZ+0x8] -> {.., 5, 8, 0x003f010a}.
++                ra = 0xff if op == 0x15b2 else bits(w, 31, 24)
++                off = bits(w, 63, 40)
++                entries.append(struct.pack("<4I", i * 16, ra, off, flags))
+         return entries
+ 
+     @staticmethod
+@@ -466,7 +490,9 @@ class CubinBuilder:
  
      # ------------------------------------------------------------------
      def _mangle(self) -> str:
@@ -414,7 +479,7 @@ index acb221d..462780b 100644
  
      # ------------------------------------------------------------------
      def build(self) -> bytes:
-@@ -529,15 +549,17 @@ class CubinBuilder:
+@@ -529,15 +555,17 @@ class CubinBuilder:
          # rejected on Hopper with CUDA_ERROR_NO_BINARY_FOR_GPU).  sm100,
          # sm103 and sm120 share the Blackwell note/compat container ABI.
          _is_blackwell = arch.current().name in (
@@ -435,7 +500,7 @@ index acb221d..462780b 100644
                      flags=SHF_INFO_LINK | SHF_CUDA_RETAIN)
              else:
                  sec(".note.nv.cuver", SHT_NOTE,
-@@ -557,7 +579,7 @@ class CubinBuilder:
+@@ -557,7 +585,7 @@ class CubinBuilder:
          # after .text — the driver links a kernel's static shared window to
          # this symbol.
          sym_shared = None
@@ -444,7 +509,7 @@ index acb221d..462780b 100644
              sym_shared = symtab.add(strtab.add(f".nv.shared.{mn}"),
                                      STB_LOCAL, STT_SECTION, 0)
          if tcgen05_cta1:
-@@ -601,6 +623,17 @@ class CubinBuilder:
+@@ -601,6 +629,17 @@ class CubinBuilder:
                  STB_GLOBAL, STT_NOTYPE, 0, value=0x40)
          sym_cg = symtab.add(strtab.add(".nv.callgraph"),
                              STB_LOCAL, STT_SECTION, 0)
@@ -462,7 +527,7 @@ index acb221d..462780b 100644
          # st_other bit 4 = STO_ENTRY (cuobjdump -symbols prints 0x10 as
          # STO_ENTRY): marks the symbol as a kernel entry point.  Without it
          # the cubin loads and runs normally, but ncu's counter-enabled replay
-@@ -636,10 +669,16 @@ class CubinBuilder:
+@@ -636,10 +675,16 @@ class CubinBuilder:
          nv_info = eiattr_regcount(sym_func, self._regcount)
          if self._shader_type is not None:
              nv_info += eiattr_shader_type(sym_func, self._shader_type)
@@ -483,7 +548,7 @@ index acb221d..462780b 100644
          sec(".nv.info", SHT_CUDA_INFO, content=nv_info)
  
          # 8: .nv.info.<mangled> (per-kernel)
-@@ -735,6 +774,11 @@ class CubinBuilder:
+@@ -735,6 +780,11 @@ class CubinBuilder:
          buf += eiattr_hval(0x19, total_ps)  # CBANK_PARAM_SIZE
          buf += eiattr_param_cbank(sym_c0, param_base, total_ps)  # PARAM_CBANK
          buf += eiattr_sval(0x36, 8 if tcgen05_cta1 else 0)  # SW_WAR
@@ -495,7 +560,7 @@ index acb221d..462780b 100644
          sec(f".nv.info.{mn}", SHT_CUDA_INFO, content=buf,
              flags=SHF_INFO_LINK)
  
-@@ -768,6 +812,16 @@ class CubinBuilder:
+@@ -768,6 +818,16 @@ class CubinBuilder:
                          0x09, 0x00, 0x00, 0x00,
                          0x00, 0x00, 0x00, 0x00,
                      ])
@@ -512,7 +577,7 @@ index acb221d..462780b 100644
              else:
                  compat = bytes([
                      0x02, 0x02, 0x03 if tcgen05_cta1 else 0x01, 0x00,
-@@ -782,6 +836,14 @@ class CubinBuilder:
+@@ -782,6 +842,14 @@ class CubinBuilder:
          cg = struct.pack("<8i", 0, -1, 0, -2, 0, -3, 0, -4)
          sec(".nv.callgraph", SHT_CUDA_CALLGRAPH, content=cg, entsize=8)
  
@@ -527,7 +592,7 @@ index acb221d..462780b 100644
          # 11: .text.<mangled>
          raw = b"".join(struct.pack("<QQ", lo & MASK64, hi & MASK64)
                         for lo, hi in self._instructions)
-@@ -808,7 +870,7 @@ class CubinBuilder:
+@@ -808,7 +876,7 @@ class CubinBuilder:
          # the SHF_INFO_LINK bit is what marks it as the real shared image.
          # nvcc pads the declared size by 0x400 (the CTA shared base window):
          # 16KB of __shared__ -> a 0x4400 section, so usable = size - 0x400.
@@ -536,7 +601,7 @@ index acb221d..462780b 100644
              sec(f".nv.shared.{mn}", SHT_NOBITS, content=b"\x00" * (self._shared_mem + 0x400),
                  flags=SHF_WRITE | SHF_ALLOC | SHF_INFO_LINK, align=4, nobits=True)
  
-@@ -833,7 +895,8 @@ class CubinBuilder:
+@@ -833,7 +901,8 @@ class CubinBuilder:
          shmem_sec_name = ".nv.shared.reserved.0"
          cg_sec_name = ".nv.callgraph"
          c0_sec_name = f".nv.constant0.{mn}"
@@ -546,7 +611,7 @@ index acb221d..462780b 100644
  
          for i, s in enumerate(secs):
              if s.name == text_sec_name:
-@@ -863,6 +926,11 @@ class CubinBuilder:
+@@ -863,6 +932,11 @@ class CubinBuilder:
          symtab.entries[sym_cg].st_shndx = cg_sec_idx
          symtab.entries[sym_func].st_shndx = text_sec_idx
          symtab.entries[sym_c0].st_shndx = c0_sec_idx
@@ -675,3 +740,25 @@ index 0ffc54f..0f85a9c 100644
      def _resolve_params(self, inst: ParsedInstruction, decl: KernelDecl) -> None:
          """Replace PARAM_REF operands with CONST_BANK using actual cmem offsets."""
          for op in inst.operands:
+diff --git a/tools/parse_sm90.py b/tools/parse_sm90.py
+index 94bde0d..a971813 100644
+--- a/tools/parse_sm90.py
++++ b/tools/parse_sm90.py
+@@ -145,7 +145,7 @@ def _parse_enum_body(body: str) -> dict:
+ 
+ def parse_enums(lines, start, end):
+     enums = {}
+-    def_re = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s+(.*)$')
++    def_re = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_.]*)\s+(.*)$')
+     blob = "\n".join(lines[start:end])
+     # split on ';' but keep it simple: statements are ';'-terminated
+     for stmt in blob.split(";"):
+@@ -291,7 +291,7 @@ SUBSECTIONS = ["FORMAT", "CONDITIONS", "PROPERTIES", "PREDICATES", "OPCODES", "E
+ 
+ SLOT_RE = re.compile(
+     r"(/)?"                              # modifier marker
+-    r"([A-Za-z_][A-Za-z0-9_]*)"          # Type
++    r"([A-Za-z_][A-Za-z0-9_.]*)"         # Type (dots allowed: F64.F32ONLY)
+     r"(?:\(([^)]*)\))?"                  # (default)
+     r"\*?"                               # optional *
+     r":([A-Za-z_][A-Za-z0-9_.]*)"        # :name

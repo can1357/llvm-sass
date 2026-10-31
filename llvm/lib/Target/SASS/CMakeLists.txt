@@ -28,6 +28,9 @@ add_llvm_target(SASSCodeGen
   SASSLowerInlinePTX.cpp
   SASSLiftIdioms.cpp
   SASSLowerMath.cpp
+  SASSLowerIEEE.cpp
+  SASSLowerIntDiv.cpp
+  SASSISelConv.cpp
   SASSLocalMemory.cpp
   SASSLowerKernelArgs.cpp
   SASSLowerMemcpy.cpp
@@ -36,6 +39,8 @@ add_llvm_target(SASSCodeGen
   SASSSelectionDAGInfo.cpp
   SASSSubtarget.cpp
   SASSTargetMachine.cpp
+  SASSReconverge.cpp
+  SASSISelWarp.cpp
   SASSUniformAddr.cpp
   SASSWGMMA.cpp
 

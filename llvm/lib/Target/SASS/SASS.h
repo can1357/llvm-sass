@@ -28,20 +28,22 @@ class Module;
 class PassRegistry;
 class raw_ostream;
 class SASSTargetMachine;
+class SASSSubtarget;
 class MachineFunction;
 class MCRegisterClass;
 using TargetRegisterClass = MCRegisterClass;
 
 namespace SASS {
-/// Byte offset of a static __shared__ variable within the user shared window
-/// (which starts 0x400 bytes into the CTA's shared memory). All addrspace(3)
-/// globals of the module are laid out in declaration order.
-uint64_t sharedOffset(const GlobalVariable &GV);
-/// Total static shared memory of the module (the `#pragma SHARED` size).
+/// Byte offset of a static __shared__ variable within kernel \p F's user
+/// shared window (which starts 0x400 bytes into the CTA's shared memory).
+/// The addrspace(3) globals the kernel uses are laid out in declaration
+/// order.
+uint64_t sharedOffset(const GlobalVariable &GV, const Function &F);
+/// Total static shared memory of kernel \p F (the `#pragma SHARED` size).
 /// With extern (dynamic) __shared__ arrays it is padded to their base.
-uint64_t sharedBytes(const Module &M);
-/// True if the module declares extern (dynamic) __shared__ arrays.
-bool hasDynamicShared(const Module &M);
+uint64_t sharedBytes(const Function &F);
+/// True if kernel \p F uses extern (dynamic) __shared__ arrays.
+bool hasDynamicShared(const Function &F);
 /// Selects an atomic, fence or volatile memory node (SASSISelAtomics.cpp);
 /// the result replaces \p N's chain (and value, when both have one). Null if
 /// \p N is not one of them.
@@ -49,6 +51,9 @@ SDNode *selectAtomic(SelectionDAG &DAG, SDNode *N);
 /// Selects an NVVM intrinsic emitted for inline PTX that needs C++
 /// (SASSISelPTX.cpp); replaces \p N and returns true if it is one.
 bool selectPTXIntrinsic(SelectionDAG &DAG, SDNode *N);
+/// Selects a warp collective (shuffle, vote, match, warp barrier;
+/// SASSISelWarp.cpp); replaces \p N and returns true if it is one.
+bool selectWarpIntrinsic(SelectionDAG &DAG, SDNode *N);
 /// Expands a UNI_* pseudo (uniform-register operands) into its issue loop;
 /// returns the block where selection continues, or null for other
 /// instructions.
@@ -99,8 +104,9 @@ FunctionPass *createSASSLowerMemcpyPass();
 ModulePass *createSASSInlineCallsPass();
 namespace SASS {
 /// Register count (as the cubin reports it, at most 255) a kernel may use:
-/// with __launch_bounds__(maxThreads, minBlocksPerSM), the most that still
-/// fits minBlocksPerSM blocks in the 64K-register file. Enforced by
+/// with __launch_bounds__(maxThreads[, minBlocksPerSM]), the most that still
+/// fits minBlocksPerSM (default 1) blocks in the four 16K-register SM
+/// sub-partitions, capped by __maxnreg__ ("nvvm.maxnreg"). Enforced by
 /// reserving the registers above it (SASSRegisterInfo) and respected by the
 /// pre-RA scheduler's pressure margin.
 unsigned maxRegCount(const Function &F);
@@ -110,9 +116,21 @@ unsigned maxRegCount(const Function &F);
 /// as IDP.4A, full-warp butterfly reductions as REDUX.
 FunctionPass *createSASSLiftIdiomsPass();
 /// Lowers approximate f32 math (afn libm intrinsics and fdiv, NVVM approx
-/// intrinsics) to MUFU primitives with ptxas's denormal fix-ups; diagnoses
-/// precise transcendentals, division and square root.
+/// intrinsics) to MUFU primitives with ptxas's denormal fix-ups. Precise
+/// division and square root are SASSLowerIEEE's.
 FunctionPass *createSASSLowerMathPass();
+/// Expands IEEE f32 division, reciprocal and square root into ptxas's fast
+/// paths and slow-path blocks (SASSLowerIEEE.cpp).
+FunctionPass *createSASSLowerIEEEPass();
+/// Expands integer division and remainder by variable divisors into ptxas's
+/// reciprocal sequences (SASSLowerIntDiv.cpp).
+FunctionPass *createSASSLowerIntDivPass();
+namespace SASS {
+/// Callee standing for FCHK in IR, `i1 (float a, float b)`: set when a / b
+/// needs the slow path. SASSTargetLowering::lowerBuiltinCall selects it.
+inline constexpr const char FChkFn[] = "__sass_fchk";
+Function *getFChk(Module &M);
+} // namespace SASS
 /// Rewrites supported inline PTX (mma.sync, ldmatrix, stmatrix, cp.async,
 /// ex2/rcp.approx) into NVVM intrinsics.
 FunctionPass *createSASSLowerInlinePTXPass();
@@ -133,6 +151,10 @@ FunctionPass *createSASSExpandWGMMAPass();
 /// Sets gsb0 on each wgmma group's last GMMA and keeps other instructions
 /// off registers GMMAs access asynchronously (SASSWGMMA.cpp; after RA).
 FunctionPass *createSASSWGMMAHazardsPass();
+/// Brackets each divergent branch region with BSSY/BSYNC so the warp
+/// reconverges at the branch's post-dominator, as ptxas does (after block
+/// placement).
+FunctionPass *createSASSReconvergePass();
 namespace SASS {
 /// Entry register count of a kernel that executes USETMAXREG (setmaxnreg):
 /// its __launch_bounds__ allocation; 0 without USETMAXREG.
@@ -144,6 +166,9 @@ unsigned setMaxRegLimit(const MachineFunction &MF);
 bool isGPRTupleClass(const TargetRegisterClass *RC);
 /// WARPGROUP.ARRIVE / DEPBAR: nothing is scheduled across them.
 bool isWarpgroupSync(const MachineInstr &MI);
+/// Whether divergent regions get convergence barriers (SASSReconverge) and
+/// IR values carry real uniformity: Hopper, or -sass-reconverge elsewhere.
+bool reconverges(const SASSSubtarget &ST);
 } // namespace SASS
 
 void initializeSASSAsmPrinterPass(PassRegistry &);
@@ -154,12 +179,15 @@ void initializeSASSLowerKernelArgsPass(PassRegistry &);
 void initializeSASSLowerAllocaPass(PassRegistry &);
 void initializeSASSLowerInlinePTXPass(PassRegistry &);
 void initializeSASSLowerMathPass(PassRegistry &);
+void initializeSASSLowerIEEEPass(PassRegistry &);
+void initializeSASSLowerIntDivPass(PassRegistry &);
 void initializeSASSLiftIdiomsPass(PassRegistry &);
 void initializeSASSExpandInlinePTXPass(PassRegistry &);
 void initializeSASSPreRASchedPass(PassRegistry &);
 void initializeSASSUniformAddrPass(PassRegistry &);
 void initializeSASSExpandWGMMAPass(PassRegistry &);
 void initializeSASSWGMMAHazardsPass(PassRegistry &);
+void initializeSASSReconvergePass(PassRegistry &);
 void initializeSASSLowerMemcpyPass(PassRegistry &);
 void initializeSASSInlineCallsPass(PassRegistry &);
 } // namespace llvm

@@ -59,7 +59,7 @@ public:
   }
   bool isFPImmLegal(const APFloat &Imm, EVT VT,
                     bool ForCodeSize) const override {
-    return VT == MVT::f32 || VT == MVT::f16 || VT == MVT::bf16;
+    return VT == MVT::f32 || VT == MVT::f64 || VT == MVT::f16 || VT == MVT::bf16;
   }
   /// Atomics (SASSISelLoweringTypes.cpp): native ATOM*/RED forms stay, the
   /// rest become compare-and-swap loops; orderings become fences around a
@@ -96,6 +96,12 @@ private:
   SDValue lowerPTXOp(SDValue Op, SelectionDAG &DAG) const;
   bool replacePTXResults(SDNode *N, SmallVectorImpl<SDValue> &Results,
                          SelectionDAG &DAG) const;
+  /// Operation actions for rounding and conversions (SASSISelConv.cpp).
+  void initConvActions();
+  /// Calls to SASS builtins standing for instructions (SASS::FChkFn): the
+  /// chain, with the result in \p InVals; null for other calls.
+  SDValue lowerBuiltinCall(CallLoweringInfo &CLI,
+                           SmallVectorImpl<SDValue> &InVals) const;
   /// Custom lowering of the nodes initTypeActions marks Custom; a null
   /// SDValue means "expand".
   SDValue lowerTypesOp(SDValue Op, SelectionDAG &DAG) const;

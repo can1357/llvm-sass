@@ -128,7 +128,8 @@ void SASSInstrInfo::expandAdd64(MachineInstr &MI) const {
 /// Spill (STL) or reload (LDL) opcode for a register class. Predicates and
 /// uniform registers use pseudos that SASSRegisterInfo::eliminateFrameIndex
 /// expands through a scavenged GPR.
-static unsigned spillOpcode(const TargetRegisterClass *RC, bool Store) {
+static unsigned spillOpcode(const TargetRegisterClass *RC, bool Store,
+                            const TargetRegisterInfo &TRI) {
   if (SASS::GPR32RegClass.hasSubClassEq(RC))
     return Store ? SASS::STL32 : SASS::LDL32;
   if (SASS::GPR64RegClass.hasSubClassEq(RC))
@@ -141,7 +142,15 @@ static unsigned spillOpcode(const TargetRegisterClass *RC, bool Store) {
     return Store ? SASS::SPILL_UR32 : SASS::RELOAD_UR32;
   if (SASS::UGPR64RegClass.hasSubClassEq(RC))
     return Store ? SASS::SPILL_UR64 : SASS::RELOAD_UR64;
-  report_fatal_error("SASS: cannot spill this register class");
+#define GACC_SPILL(S)                                                          \
+  if (SASS::GACC##S##RegClass.hasSubClassEq(RC))                               \
+    return Store ? SASS::SPILL_GACC##S : SASS::RELOAD_GACC##S;
+  GACC_SPILL(8) GACC_SPILL(12) GACC_SPILL(16) GACC_SPILL(20) GACC_SPILL(24)
+  GACC_SPILL(28) GACC_SPILL(32) GACC_SPILL(36) GACC_SPILL(40) GACC_SPILL(44)
+  GACC_SPILL(48) GACC_SPILL(52) GACC_SPILL(56) GACC_SPILL(60) GACC_SPILL(64)
+#undef GACC_SPILL
+  report_fatal_error(Twine("SASS: cannot spill register class ") +
+                     TRI.getRegClassName(RC));
 }
 
 static MachineMemOperand *spillMemOperand(MachineBasicBlock &MBB, int FI,
@@ -156,7 +165,7 @@ void SASSInstrInfo::storeRegToStackSlot(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register SrcReg,
     bool IsKill, int FI, const TargetRegisterClass *RC, Register,
     MachineInstr::MIFlag Flags) const {
-  noGuard(BuildMI(MBB, MI, DebugLoc(), get(spillOpcode(RC, true)))
+  noGuard(BuildMI(MBB, MI, DebugLoc(), get(spillOpcode(RC, true, RI)))
               .addFrameIndex(FI)
               .addImm(0)
               .addReg(SrcReg, getKillRegState(IsKill)))
@@ -168,7 +177,7 @@ void SASSInstrInfo::loadRegFromStackSlot(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register DestReg,
     int FI, const TargetRegisterClass *RC, Register, unsigned,
     MachineInstr::MIFlag Flags) const {
-  noGuard(BuildMI(MBB, MI, DebugLoc(), get(spillOpcode(RC, false)), DestReg)
+  noGuard(BuildMI(MBB, MI, DebugLoc(), get(spillOpcode(RC, false, RI)), DestReg)
               .addFrameIndex(FI)
               .addImm(0))
       .addMemOperand(spillMemOperand(MBB, FI, MachineMemOperand::MOLoad))
@@ -206,7 +215,18 @@ Register SASSInstrInfo::isStoreToStackSlot(const MachineInstr &MI,
 }
 
 static bool isUncondBranch(unsigned Opc) { return Opc == SASS::BRA; }
-static bool isCondBranch(unsigned Opc) { return Opc == SASS::BRAc; }
+static bool isCondBranch(unsigned Opc) {
+  return Opc == SASS::BRAc || Opc == SASS::BRAcu;
+}
+
+/// Branch conditions are [predicate, negate, uniform]: uniform branches
+/// (BRAcu) need no reconvergence (SASSReconverge).
+static void pushCond(const MachineInstr &Br, unsigned G,
+                     SmallVectorImpl<MachineOperand> &Cond) {
+  Cond.push_back(Br.getOperand(G));
+  Cond.push_back(Br.getOperand(G + 1));
+  Cond.push_back(MachineOperand::CreateImm(Br.getOpcode() == SASS::BRAcu));
+}
 
 /// Guard operand index of \p MI (predicate register; the negate flag follows).
 static unsigned guardIdx(const MachineInstr &MI) {
@@ -245,8 +265,7 @@ bool SASSInstrInfo::analyzeBranch(MachineBasicBlock &MBB,
         return true;
       unsigned G = guardIdx(*Prev);
       TBB = Prev->getOperand(0).getMBB();
-      Cond.push_back(Prev->getOperand(G));
-      Cond.push_back(Prev->getOperand(G + 1));
+      pushCond(*Prev, G, Cond);
       FBB = Last.getOperand(0).getMBB();
       return false;
     }
@@ -256,8 +275,7 @@ bool SASSInstrInfo::analyzeBranch(MachineBasicBlock &MBB,
   if (isCondBranch(Last.getOpcode()) && !Prev) {
     unsigned G = guardIdx(Last);
     TBB = Last.getOperand(0).getMBB();
-    Cond.push_back(Last.getOperand(G));
-    Cond.push_back(Last.getOperand(G + 1));
+    pushCond(Last, G, Cond);
     return false;
   }
   return true; // EXIT and anything else.
@@ -293,8 +311,8 @@ unsigned SASSInstrInfo::insertBranch(MachineBasicBlock &MBB,
   if (Cond.empty()) {
     noGuard(BuildMI(&MBB, DL, get(SASS::BRA)).addMBB(TBB));
   } else {
-    assert(Cond.size() == 2 && "condition is [predicate, negate]");
-    BuildMI(&MBB, DL, get(SASS::BRAc))
+    assert(Cond.size() == 3 && "condition is [predicate, negate, uniform]");
+    BuildMI(&MBB, DL, get(Cond[2].getImm() ? SASS::BRAcu : SASS::BRAc))
         .addMBB(TBB)
         .addReg(Cond[0].getReg())
         .addImm(Cond[1].getImm());
@@ -333,7 +351,8 @@ bool SASSInstrInfo::PredicateInstruction(MachineInstr &MI,
     return false;
   // Unconditional terminators become their non-barrier twins once guarded.
   if (MI.getOpcode() == SASS::BRA)
-    MI.setDesc(get(SASS::BRAc));
+    MI.setDesc(get(Pred.size() > 2 && Pred[2].getImm() ? SASS::BRAcu
+                                                       : SASS::BRAc));
   else if (MI.getOpcode() == SASS::EXIT)
     MI.setDesc(get(SASS::EXITc));
   unsigned G = guardIdx(MI);

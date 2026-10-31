@@ -67,4 +67,11 @@ def RELOAD_P : SASSInst<(outs PRED:$d), (ins mems:$addr), "">;
 def RELOAD_UR32 : SASSInst<(outs UGPR32:$d), (ins mems:$addr), "">;
 def RELOAD_UR64 : SASSInst<(outs UG64:$d), (ins mems:$addr), "">;
 }
+// wgmma accumulator tuples (4-aligned): one STL.128/LDL.128 per quad.
+foreach S = !range(8, 65, 4) in {
+let mayStore = 1 in
+def SPILL_GACC#S : SASSInst<(outs), (ins mems:$addr, !cast<RegisterClass>("GACC"#S):$v), "">;
+let mayLoad = 1 in
+def RELOAD_GACC#S : SASSInst<(outs !cast<RegisterClass>("GACC"#S):$d), (ins mems:$addr), "">;
+}
 }

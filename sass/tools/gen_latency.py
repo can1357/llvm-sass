@@ -32,12 +32,14 @@ MNEMONICS = """IADD IADD3 IMAD LOP3 SHF ISETP SEL VIMNMX MOV FADD FMUL FFMA FSET
 FMNMX I2FP F2I MUFU LDG STG LD ST LDS STS LDC LDCU S2R S2UR BAR BRA EXIT PLOP3
 PRMT POPC FLO SHFL LEA NOP R2UR UIADD3 UMOV ULDC HMMA LDSM STSM HFMA2
 FSET IDP BREV REDUX IABS
-HGMMA QGMMA WARPGROUP VOTEU USETMAXREG WARPSYNC""".split()
+HGMMA QGMMA WARPGROUP VOTEU USETMAXREG WARPSYNC VOTE ELECT DFMA""".split()
 
 # Table set name in the .inc -> latency dump in sass-dec.
 ARCHES = {"SM90": "sm_90_latencies.txt", "SM120": "sm120_latencies.txt"}
 
-OUT = ROOT.parent / "llvm" / "lib" / "Target" / "SASS"
+# llvm-sass overlay checkout (./llvm) or llvm-project tree (sass/../llvm).
+OUT = next(d for d in (ROOT / "llvm" / "lib" / "Target" / "SASS", ROOT.parent / "llvm" / "lib" / "Target" / "SASS")
+           if d.is_dir())
 
 
 def cell(value: str) -> int:
@@ -89,6 +91,11 @@ def main() -> None:
         tables = [matrix(lat, "GPR", None), matrix(lat, "PRED", None, exclude={"Pg"}),
                   matrix(lat, "PRED", {"Pg"}), matrix(lat, "UGPR", None),
                   matrix(lat, "GPR", None, dep="ANTI")]
+        # The dump lists VOTE's predicate source under the guard role only
+        # (ptxas waits 13 cycles after ISETP, as for a guard).
+        vote = MNEMONICS.index("VOTE")
+        for prod in range(len(MNEMONICS)):
+            tables[1][prod][vote] = max(tables[1][prod][vote], tables[2][prod][vote])
         inc.append(f"static const LatencyTables {name}Latencies = {{\n" + ",\n".join(map(emit_matrix, tables)) + "};\n")
         nz = [sum(v > 0 for row in m for v in row) for m in tables]
         print(f"{name}: nonzero cells GPR {nz[0]}, Pred {nz[1]}, PredGuard {nz[2]}, UGPR {nz[3]}, Anti {nz[4]}")

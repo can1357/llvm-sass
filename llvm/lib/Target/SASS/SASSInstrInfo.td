@@ -94,11 +94,12 @@ class SASSInst<dag od, dag id, string asm, list<dag> pattern = []>
   let TSFlags{11-8} = MinStall;
   let TSFlags{12} = FTZ;
   // Every instruction has a guard operand, which makes TableGen mark it
-  // predicable whatever `isPredicable` says; NoGuard keeps an instruction
-  // out of if-conversion (uniform-datapath instructions need a uniform
-  // guard).
+  // predicable whatever `isPredicable` says; NoGuard (implied by
+  // `isPredicable = 0`) keeps an instruction out of if-conversion
+  // (uniform-datapath instructions need a uniform guard, BAR.SYNC a
+  // converged warp).
   bit NoGuard = 0;
-  let TSFlags{13} = NoGuard;
+  let TSFlags{13} = !or(NoGuard, !not(isPredicable));
 }
 
 // Decoupled (scoreboarded) instructions: MIO/UDP pipes.
@@ -311,7 +312,7 @@ def : Pat<(i1 (trunc i32:$a)), (ISETPri (LOP3rir $a, 1, (i32 RZ), 0xc0), 0, 5, (
 
 def simm32_64 : ImmLeaf<i64, [{ return isInt<32>(Imm); }]>;
 def trunc_imm : SDNodeXForm<imm, [{
-  return CurDAG->getTargetConstant((int32_t)N->getSExtValue(), SDLoc(N), MVT::i32);
+  return CurDAG->getSignedTargetConstant((int32_t)N->getSExtValue(), SDLoc(N), MVT::i32);
 }]>;
 
 // IADD.64 exists from Blackwell. On Hopper the custom inserter
@@ -606,6 +607,17 @@ let mayLoad = 1, mayStore = 1, LatMnem = LAT_STS, ReadSB = 1,
 def LDGSTS_CA32 : SASSInst<(outs), (ins mems:$s, memg:$g), "LDGSTS.E $s, $g">;
 def LDGSTS_CA64 : SASSInst<(outs), (ins mems:$s, memg:$g), "LDGSTS.E.64 $s, $g">;
 def LDGSTS_CA128 : SASSInst<(outs), (ins mems:$s, memg:$g), "LDGSTS.E.128 $s, $g">;
+// cp.async with a src-size of 0 or the copy size: the trailing predicate says
+// whether the source is read (else the destination is zero-filled), as ptxas
+// emits it.
+def LDGSTS128_P : SASSInst<(outs), (ins mems:$s, memg:$g, PRED:$v, negflag:$vn),
+                           "LDGSTS.E.BYPASS.128 $s, $g, ${vn}$v">;
+def LDGSTS_CA32_P : SASSInst<(outs), (ins mems:$s, memg:$g, PRED:$v, negflag:$vn),
+                             "LDGSTS.E $s, $g, ${vn}$v">;
+def LDGSTS_CA64_P : SASSInst<(outs), (ins mems:$s, memg:$g, PRED:$v, negflag:$vn),
+                             "LDGSTS.E.64 $s, $g, ${vn}$v">;
+def LDGSTS_CA128_P : SASSInst<(outs), (ins mems:$s, memg:$g, PRED:$v, negflag:$vn),
+                              "LDGSTS.E.128 $s, $g, ${vn}$v">;
 }
 
 //===----------------------------------------------------------------------===//
@@ -834,3 +846,5 @@ include "SASSInstrLocal.td"
 include "SASSInstrPTX.td"
 include "SASSInstrGlobals.td"
 include "SASSInstrWGMMA.td"
+include "SASSInstrWarp.td"
+include "SASSInstrConv.td"

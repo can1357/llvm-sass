@@ -62,7 +62,7 @@ foreach I = 0-30 in
 // in the class so patterns can name it as a zero source.
 def GPR32 : RegisterClass<"SASS", [i32, f32, v2f16, v2bf16, f16, bf16], 32,
                           (add (sequence "R%u", 0, 254), RZ)>;
-def GPR64 : RegisterClass<"SASS", [i64], 64, (sequence "RD%u", 0, 126)>;
+def GPR64 : RegisterClass<"SASS", [i64, f64], 64, (sequence "RD%u", 0, 126)>;
 def GPR128 : RegisterClass<"SASS", [v4i32, v4f32], 128,
                            (sequence "RQ%u", 0, 62)>;
 // Predicates spill as one byte (SASSRegisterInfo::eliminateFrameIndex).

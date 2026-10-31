@@ -103,9 +103,8 @@ void SASSAsmPrinter::emitFunctionEntryLabel() {
   // Per-thread local memory below R1 (SASSFrameLowering).
   if (uint64_t Stack = MF->getFrameInfo().getStackSize())
     OS << "\n    #pragma STACK_SIZE(" << Stack << ')';
-  const Module &M = *MF->getFunction().getParent();
-  uint64_t Shared = SASS::sharedBytes(M);
-  if (Shared || SASS::hasDynamicShared(M))
+  uint64_t Shared = SASS::sharedBytes(MF->getFunction());
+  if (Shared || SASS::hasDynamicShared(MF->getFunction()))
     OS << "\n    #pragma SHARED(" << Shared << ')';
   SASS::printConstantObjects(MF->getFunction(), OS);
   OutStreamer->emitRawText(OS.str());
