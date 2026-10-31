@@ -1,0 +1,210 @@
+diff --git a/assembler/arch.py b/assembler/arch.py
+index 71822b9..02c7aa7 100644
+--- a/assembler/arch.py
++++ b/assembler/arch.py
+@@ -73,6 +73,11 @@ ARCHES: dict[str, ArchConfig] = {
+                           0x0600670a, 0x41, 0x08),
+     "sm120": ArchConfig("sm120", "sm120.json", (0, 0x358), 0x380,
+                          0x06007802, 0x41, 0x08),
++    # GB10 (DGX Spark): sm_120 ISA; nvcc 13.4 -arch=sm_121 e_flags.  The
++    # driver refuses sm_120 SASS on sm_121 unless a Mercury capsule lets it
++    # re-finalize, so hand-assembled code must carry the native target.
++    "sm121": ArchConfig("sm121", "sm120.json", (0, 0x358), 0x380,
++                         0x06007902, 0x41, 0x08),
+ }
+ DEFAULT_ARCH = "sm120"
+ 
+diff --git a/assembler/sass_depcheck.py b/assembler/sass_depcheck.py
+index c572094..97bf575 100644
+--- a/assembler/sass_depcheck.py
++++ b/assembler/sass_depcheck.py
+@@ -111,9 +111,10 @@ class Claim:
+     """An outstanding scoreboard usage (wr or rd)."""
+     idx: int                 # producing instruction index
+     kind: str                # 'wr' | 'rd'
+-    sb: int                  # 0..5 (7 = none never reaches here)
++    sb: int                  # 0..5; 7 for 'lds' (untracked shared load)
+     regs: set                # covered registers (RegKey)
+     predicated: bool = False
++    inorder: bool = False    # producer is a shared load (in-order LSU returns)
+ 
+     def __hash__(self):
+         return hash((self.idx, self.kind, self.sb))
+@@ -296,6 +297,12 @@ def build_cfg(insts, infos, addrs):
+     targets = {}          # idx -> list of target idx (None for any-succ)
+     ft = {}               # idx -> has fall-through
+     bssy_stack = []       # (barReg, target_idx)
++    # insts interleaves label entries (info None) with instructions, so a
++    # target address maps to the first entry at that address (its label,
++    # which then leads the block), not to address // 16.
++    index_at = {}
++    for j in range(n):
++        index_at.setdefault(addrs[j], j)
+     for i in range(n):
+         info = infos[i]
+         if info is None:
+@@ -311,7 +318,7 @@ def build_cfg(insts, infos, addrs):
+             from .operand import OperandKind
+             if op.kind == OperandKind.IMM_S:
+                 target_addr = addrs[i] + 16 + op.value
+-                tgt = target_addr // 16
++                tgt = index_at.get(target_addr, n)
+         if mn == "BSSY":
+             bssy_stack.append((insts[i].pred, tgt))
+             ft[i] = True
+@@ -412,7 +419,21 @@ def build_cfg(insts, infos, addrs):
+ # Dataflow + diagnostics
+ # --------------------------------------------------------------------------
+ def _kill_claims(claims: set, sb: int):
+-    return {c for c in claims if c.sb != sb}
++    """Settle a wait on `sb`. Shared loads return in issue order (ptxas relies
++    on it, leaving some LDS at wr=7), so settling a scoreboard that tracks a
++    shared load also settles every untracked shared load issued before it.
++    Instruction order only stands for issue order within one pass over a
++    block; across a back edge a stale claim simply stays (conservative)."""
++    newest = max((c.idx for c in claims
++                  if c.sb == sb and c.kind == 'wr' and c.inorder), default=None)
++    kept = {c for c in claims if c.sb != sb}
++    if newest is not None:
++        kept = {c for c in kept if not (c.kind == 'lds' and c.idx < newest)}
++    return kept
++
++
++def _is_inorder_load(info) -> bool:
++    return info.mnemonic == "LDS"
+ 
+ 
+ def _register(claims: set, ub: dict, info: InstrInfo, track_count: bool):
+@@ -420,7 +441,9 @@ def _register(claims: set, ub: dict, info: InstrInfo, track_count: bool):
+     dataflow transfer and the diagnostic pass so both stay in sync."""
+     if info.cls in _WR_CLASSES and info.defs and info.wr_sb != 7:
+         claims.add(Claim(info.idx, 'wr', info.wr_sb, set(info.defs),
+-                         info.predicated))
++                         info.predicated, _is_inorder_load(info)))
++    elif info.cls in _WR_CLASSES and info.defs and _is_inorder_load(info):
++        claims.add(Claim(info.idx, 'lds', 7, set(info.defs), info.predicated))
+         if track_count:
+             ub[info.wr_sb] = ub.get(info.wr_sb, 0) + 1
+     if info.cls in _RD_CLASSES and info.rd_sb != 7:
+@@ -428,6 +451,14 @@ def _register(claims: set, ub: dict, info: InstrInfo, track_count: bool):
+                          info.predicated))
+         if track_count:
+             ub[info.rd_sb] = ub.get(info.rd_sb, 0) + 1
++    elif (info.cls in _RD_CLASSES and info.late_uses and info.defs
++          and info.cls in _WR_CLASSES and info.wr_sb != 7):
++        # No read scoreboard: the sources are still collected late (an XU op
++        # waits for an admission credit; MUFU.EX2 inputs overwritten the next
++        # cycle were corrupted on GB10). Its result lands only after they are
++        # read, so the write scoreboard is what protects them.
++        claims.add(Claim(info.idx, 'rd', info.wr_sb, set(info.late_uses),
++                         info.predicated))
+ 
+ 
+ class DepChecker:
+@@ -528,6 +559,13 @@ class DepChecker:
+             # ---- true-dependency: every use needs covering req ----
+             for r in sorted(info.uses | info.guards):
+                 for c in claims:
++                    if c.kind == 'lds' and r in c.regs:
++                        self._warn(
++                            i, "missing_req",
++                            f"reads {_regname(r)} from untracked shared load "
++                            f"inst {c.idx} without a wait on a later shared "
++                            f"load's scoreboard", reg=_regname(r), prod=c.idx)
++                        break
+                     if c.kind == 'wr' and r in c.regs:
+                         if c.sb not in info.req_bits:
+                             self._warn(
+@@ -537,6 +575,17 @@ class DepChecker:
+                                 reg=_regname(r), sb=c.sb, prod=c.idx)
+                         break   # one covering claim is enough
+ 
++            # ---- output dependency on an untracked shared load ----
++            for r in sorted(info.defs):
++                for c in claims:
++                    if c.kind == 'lds' and r in c.regs:
++                        self._warn(
++                            i, "missing_req",
++                            f"redefines {_regname(r)} while untracked shared "
++                            f"load inst {c.idx} may still write it",
++                            reg=_regname(r), prod=c.idx)
++                        break
++
+             # ---- anti-dependency: defs vs outstanding rd claims ----
+             for r in sorted(info.defs | info.def_preds):
+                 for c in claims:
+@@ -561,7 +610,8 @@ class DepChecker:
+                         f"is outstanding", sb=sb)
+ 
+             # ---- register claims ----
+-            if info.cls in _WR_CLASSES and info.defs and info.wr_sb == 7:
++            if (info.cls in _WR_CLASSES and info.defs and info.wr_sb == 7
++                    and not _is_inorder_load(info)):
+                 # missing_wr_sb: variable-latency result consumed later
+                 if self._def_used_later(i, info.defs, infos):
+                     self._warn(
+diff --git a/assembler/sass_elf.py b/assembler/sass_elf.py
+index acb221d..0d86ee1 100644
+--- a/assembler/sass_elf.py
++++ b/assembler/sass_elf.py
+@@ -466,7 +466,9 @@ class CubinBuilder:
+ 
+     # ------------------------------------------------------------------
+     def _mangle(self) -> str:
+-        return f"_Z{len(self._kernel_name)}{self._kernel_name}"
++        # Verbatim: compilers emit the real symbol (extern "C" or Itanium-
++        # mangled); CudaModule.func still resolves plain names.
++        return self._kernel_name
+ 
+     # ------------------------------------------------------------------
+     def build(self) -> bytes:
+@@ -529,15 +531,17 @@ class CubinBuilder:
+         # rejected on Hopper with CUDA_ERROR_NO_BINARY_FOR_GPU).  sm100,
+         # sm103 and sm120 share the Blackwell note/compat container ABI.
+         _is_blackwell = arch.current().name in (
+-            "sm100", "sm100a", "sm103", "sm103a", "sm120")
++            "sm100", "sm100a", "sm103", "sm103a", "sm120", "sm121")
+         if _is_blackwell:
+             sec(".note.nv.tkinfo", SHT_NOTE,
+                 content=note_nv_tkinfo(arch.current().name),
+                 flags=SHF_CUDA_LINK_ONCE)
+             target_sm = int(arch.current().name[2:].rstrip("a"))
+-            if arch.current().name in ("sm103", "sm103a"):
++            # The CUDA 13 driver (615.x) segfaults in cuModuleLoadData on the
++            # deprecated .note.nv.cuver; nvcc 13.4 emits cuinfo v2, API 0x86.
++            if arch.current().name in ("sm103", "sm103a", "sm120", "sm121"):
+                 sec(".note.nv.cuinfo", SHT_NOTE,
+-                    content=note_nv_cuinfo(target_sm),
++                    content=note_nv_cuinfo(target_sm, 0x86 if target_sm >= 120 else 0x83),
+                     flags=SHF_INFO_LINK | SHF_CUDA_RETAIN)
+             else:
+                 sec(".note.nv.cuver", SHT_NOTE,
+@@ -735,6 +739,11 @@ class CubinBuilder:
+         buf += eiattr_hval(0x19, total_ps)  # CBANK_PARAM_SIZE
+         buf += eiattr_param_cbank(sym_c0, param_base, total_ps)  # PARAM_CBANK
+         buf += eiattr_sval(0x36, 8 if tcgen05_cta1 else 0)  # SW_WAR
++        if arch.current().name in ("sm120", "sm121"):
++            # EIATTR_NVSAL_SW_WAR=1, as nvcc 13.4 emits: without it the
++            # CUDA 13.4 driver loads this module but fails the next
++            # cuModuleLoadData in the context with CUDA_ERROR_UNKNOWN.
++            buf += struct.pack("<BBH", 3, 0x6b, 1)
+         sec(f".nv.info.{mn}", SHT_CUDA_INFO, content=buf,
+             flags=SHF_INFO_LINK)
+ 
+@@ -768,6 +777,16 @@ class CubinBuilder:
+                         0x09, 0x00, 0x00, 0x00,
+                         0x00, 0x00, 0x00, 0x00,
+                     ])
++            elif arch.current().name in ("sm120", "sm121"):
++                # GB10 (CUDA 13.4 driver): TCGEN05_MMA gives NO_BINARY_FOR_GPU,
++                # and nvcc's Mercury records (0x07/0x09/...) make the loader
++                # look for the .nv.merc capsule and segfault without it.  No
++                # OPPORTUNISTIC_FINALIZATION either: there is no capsule to
++                # re-finalize from.
++                compat = bytes([
++                    0x02, 0x02, 0x01, 0x00,  # ISA_CLASS=1
++                    0x02, 0x03, 0x00, 0x00,  # TENSORMAP_V1=0
++                ])
+             else:
+                 compat = bytes([
+                     0x02, 0x02, 0x03 if tcgen05_cta1 else 0x01, 0x00,
