@@ -10,6 +10,7 @@
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IntrinsicsNVPTX.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/KnownBits.h"
@@ -23,7 +24,19 @@ SASSTargetLowering::SASSTargetLowering(const TargetMachine &TM,
   addRegisterClass(MVT::i32, &SASS::GPR32RegClass);
   addRegisterClass(MVT::f32, &SASS::GPR32RegClass);
   addRegisterClass(MVT::i64, &SASS::GPR64RegClass);
+  // Halves live in 32-bit registers: scalars in the low 16 bits, packed
+  // pairs in the whole register (operation actions: initTypeActions).
+  for (MVT VT : {MVT::v2f16, MVT::v2bf16, MVT::f16, MVT::bf16})
+    addRegisterClass(VT, &SASS::GPR32RegClass);
   computeRegisterProperties(ST.getRegisterInfo());
+  for (MVT VT : {MVT::v2f16, MVT::v2bf16}) {
+    for (unsigned Op = 0; Op < ISD::BUILTIN_OP_END; ++Op)
+      setOperationAction(Op, VT, Expand);
+    setOperationAction(ISD::BITCAST, VT, Legal);
+    setOperationAction({ISD::LOAD, ISD::STORE}, VT, Promote);
+    AddPromotedToType(ISD::LOAD, VT, MVT::i32);
+    AddPromotedToType(ISD::STORE, VT, MVT::i32);
+  }
 
   setBooleanContents(ZeroOrOneBooleanContent);
   // Without a pre-RA machine scheduler (see SASSSubtarget), the DAG
@@ -31,7 +44,6 @@ SASSTargetLowering::SASSTargetLowering(const TargetMachine &TM,
   // FMUL feeding each FFMA of an accumulator update) against pressure.
   setSchedulingPreference(Sched::Hybrid);
   setStackPointerRegisterToSaveRestore(SASS::R1);
-  setMaxAtomicSizeInBitsSupported(0);
 
   for (MVT VT : {MVT::i32, MVT::i64}) {
     setOperationAction({ISD::SDIV, ISD::UDIV, ISD::SREM, ISD::UREM,
@@ -44,6 +56,11 @@ SASSTargetLowering::SASSTargetLowering(const TargetMachine &TM,
                         ISD::SADDO_CARRY, ISD::SSUBO_CARRY},
                        VT, Expand);
   }
+  // PRMT, POPC, FLO, BREV, IABS (SASSInstrBits.td); CTTZ expands through
+  // CTPOP.
+  setOperationAction({ISD::BSWAP, ISD::CTPOP, ISD::CTLZ, ISD::BITREVERSE,
+                      ISD::ABS},
+                     MVT::i32, Legal);
   setOperationAction(ISD::ROTR, MVT::i32, Expand);
   setOperationAction({ISD::FSHL, ISD::FSHR}, MVT::i32, Custom);
   setOperationAction({ISD::MULHU, ISD::MULHS, ISD::ROTL, ISD::ROTR, ISD::FSHL,
@@ -64,6 +81,9 @@ SASSTargetLowering::SASSTargetLowering(const TargetMachine &TM,
 
   setOperationAction(ISD::ConstantFP, MVT::f32, Legal);
   setOperationAction({ISD::FMINNUM, ISD::FMAXNUM}, MVT::f32, Legal);
+  // afn tanh is MUFU.TANH (SASSInstrMath.td); the other approximate math is
+  // lowered to NVVM approx intrinsics by SASSLowerMath.
+  setOperationAction(ISD::FTANH, MVT::f32, Legal);
   setOperationAction({ISD::FCOPYSIGN, ISD::FMINIMUM, ISD::FMAXIMUM,
                       ISD::FMINIMUMNUM, ISD::FMAXIMUMNUM},
                      MVT::f32, Expand);
@@ -80,31 +100,50 @@ SASSTargetLowering::SASSTargetLowering(const TargetMachine &TM,
   setTruncStoreAction(MVT::f32, MVT::f16, Expand);
 
   setOperationAction(ISD::GlobalAddress, {MVT::i32, MVT::i64}, Custom);
+  setOperationAction(ISD::ADDRSPACECAST, {MVT::i32, MVT::i64}, Custom);
   for (MVT VT : {MVT::v2f32, MVT::v2i32, MVT::v4f32, MVT::v4i32})
     setOperationAction({ISD::LOAD, ISD::STORE}, VT, Custom);
 
   setTargetDAGCombine(ISD::ADD);
+  initTypeActions();
+  initPTXActions();
 }
 
 /// Walks the module's static shared variables in order; returns the offset of
-/// \p Stop, or the total size when \p Stop is null.
+/// \p Stop, or the total size when \p Stop is null. Every extern __shared__
+/// array is the dynamic window right after the static variables, aligned
+/// like ptxas to at least 16 bytes and to the strictest extern declaration;
+/// when there is one, the total is padded to that base.
 static uint64_t sharedLayout(const Module &M, const GlobalVariable *Stop) {
   const DataLayout &DL = M.getDataLayout();
   uint64_t Off = 0;
+  std::optional<Align> DynAlign;
   for (const GlobalVariable &G : M.globals()) {
     if (G.getAddressSpace() != 3)
       continue;
+    Align A = G.getAlign().value_or(DL.getPrefTypeAlign(G.getValueType()));
+    if (G.isDeclaration()) {
+      DynAlign = std::max(DynAlign.value_or(Align(16)), A);
+      continue;
+    }
     uint64_t Size = DL.getTypeAllocSize(G.getValueType());
-    if (G.isDeclaration() || Size == 0)
-      report_fatal_error("SASS: dynamic (extern) shared memory is not "
-                         "supported: " + G.getName());
-    Off = alignTo(Off, G.getAlign().value_or(DL.getPrefTypeAlign(G.getValueType())));
+    if (Size == 0)
+      report_fatal_error("SASS: zero-sized __shared__ variable: " + G.getName());
+    Off = alignTo(Off, A);
     if (&G == Stop)
       return Off;
     Off += Size;
   }
-  assert(!Stop && "shared variable not in its module");
+  if (DynAlign)
+    Off = alignTo(Off, *DynAlign);
+  assert((!Stop || Stop->isDeclaration()) && "shared variable not in its module");
   return Off;
+}
+
+bool SASS::hasDynamicShared(const Module &M) {
+  return any_of(M.globals(), [](const GlobalVariable &G) {
+    return G.getAddressSpace() == 3 && G.isDeclaration();
+  });
 }
 
 uint64_t SASS::sharedOffset(const GlobalVariable &GV) {
@@ -113,10 +152,10 @@ uint64_t SASS::sharedOffset(const GlobalVariable &GV) {
 
 uint64_t SASS::sharedBytes(const Module &M) { return sharedLayout(M, nullptr); }
 
-/// Vector accesses done as one LDG/LDS/LD.64/.128: 2 or 4 x 32-bit elements,
+/// Vector accesses done as one LDG/LDS/LDL/LD.64/.128: 2 or 4 x 32-bit elements,
 /// naturally aligned.
 static bool isWideAccess(EVT VT, Align A, unsigned AS) {
-  if (!VT.isSimple() || (AS != 0 && AS != 1 && AS != 3))
+  if (!VT.isSimple() || (AS != 0 && AS != 1 && AS != 3 && AS != 5))
     return false;
   switch (VT.getSimpleVT().SimpleTy) {
   case MVT::v2f32:
@@ -132,6 +171,8 @@ static bool isWideAccess(EVT VT, Align A, unsigned AS) {
 void SASSTargetLowering::ReplaceNodeResults(SDNode *N,
                                             SmallVectorImpl<SDValue> &Results,
                                             SelectionDAG &DAG) const {
+  if (replaceTypesResults(N, Results, DAG) || replacePTXResults(N, Results, DAG))
+    return;
   auto *LD = dyn_cast<LoadSDNode>(N);
   if (!LD || LD->getExtensionType() != ISD::NON_EXTLOAD || !LD->isUnindexed())
     return;
@@ -178,15 +219,34 @@ SDValue SASSTargetLowering::lowerGlobalAddress(SDValue Op,
                                                SelectionDAG &DAG) const {
   auto *GA = cast<GlobalAddressSDNode>(Op);
   auto *GV = dyn_cast<GlobalVariable>(GA->getGlobal());
-  if (!GV || GV->getAddressSpace() != 3 || Op.getValueType() != MVT::i32)
-    report_fatal_error("SASS: only static __shared__ variables (with "
-                       "-fcuda-short-ptr) are supported, not " +
-                       GA->getGlobal()->getName());
+  unsigned AS = GA->getAddressSpace();
+  if (!GV || (AS != 3 && AS != 4) || Op.getValueType() != MVT::i32)
+    report_fatal_error(
+        Twine("SASS: only __shared__ and __constant__ variables (with "
+              "-fcuda-short-ptr) are supported, not ") +
+        (AS == 1 ? "__device__ variable " : "") + GA->getGlobal()->getName());
   SDLoc DL(Op);
+  // Constant bank addresses are plain offsets; the bank an access reads is
+  // recovered from its memory operand (SASS::constBank).
+  if (AS == 4) {
+    uint64_t Off = GV->getName() == SASS::KernelParamsSymbol
+                       ? 0
+                       : SASS::constOffset(*GV);
+    return DAG.getConstant(Off + GA->getOffset(), DL, MVT::i32);
+  }
   SDValue Base = DAG.getNode(SASSISD::SMEM_BASE, DL, MVT::i32);
   return DAG.getNode(
       ISD::ADD, DL, MVT::i32, Base,
       DAG.getConstant(SASS::sharedOffset(*GV) + GA->getOffset(), DL, MVT::i32));
+}
+
+SDValue SASSTargetLowering::lowerConstAddrSpaceCast(SDValue Op,
+                                                    SelectionDAG &) const {
+  auto *ASC = cast<AddrSpaceCastSDNode>(Op);
+  if (ASC->getSrcAddressSpace() == 4 || ASC->getDestAddressSpace() == 4)
+    report_fatal_error("SASS: generic pointers to __constant__ memory are not "
+                       "supported (only direct __constant__ accesses)");
+  return Op;
 }
 
 /// Matches a 64-bit value that is a widened 32-bit value times a 32-bit
@@ -262,10 +322,58 @@ SDValue SASSTargetLowering::PerformDAGCombine(SDNode *N,
 MachineBasicBlock *
 SASSTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
                                                 MachineBasicBlock *MBB) const {
+  if (MachineBasicBlock *Next = SASS::expandPTXUniform(MI, MBB))
+    return Next;
   const auto &ST = MBB->getParent()->getSubtarget<SASSSubtarget>();
   if (!ST.hasBlackwellISA())
     ST.getInstrInfo()->expandAdd64(MI);
   return MBB;
+}
+
+void SASSTargetLowering::getTgtMemIntrinsic(
+    SmallVectorImpl<IntrinsicInfo> &Infos, const CallBase &I,
+    MachineFunction &MF, unsigned Intrinsic) const {
+  IntrinsicInfo Info;
+  Info.offset = 0;
+  Info.align = Align(16);
+  switch (Intrinsic) {
+  case Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x1_b16:
+  case Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x2_b16:
+  case Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x4_b16:
+  case Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x1_trans_b16:
+  case Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x2_trans_b16:
+  case Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x4_trans_b16:
+    Info.opc = ISD::INTRINSIC_W_CHAIN;
+    Info.memVT = MVT::getIntegerVT(I.getType()->isStructTy()
+                                       ? I.getType()->getStructNumElements() * 32
+                                       : 32);
+    Info.flags = MachineMemOperand::MOLoad;
+    break;
+  case Intrinsic::nvvm_stmatrix_sync_aligned_m8n8_x1_b16:
+  case Intrinsic::nvvm_stmatrix_sync_aligned_m8n8_x2_b16:
+  case Intrinsic::nvvm_stmatrix_sync_aligned_m8n8_x4_b16:
+  case Intrinsic::nvvm_stmatrix_sync_aligned_m8n8_x1_trans_b16:
+  case Intrinsic::nvvm_stmatrix_sync_aligned_m8n8_x2_trans_b16:
+  case Intrinsic::nvvm_stmatrix_sync_aligned_m8n8_x4_trans_b16:
+    Info.opc = ISD::INTRINSIC_VOID;
+    Info.memVT = MVT::getIntegerVT((I.arg_size() - 1) * 32);
+    Info.flags = MachineMemOperand::MOStore;
+    break;
+  case Intrinsic::nvvm_cp_async_cg_shared_global_16:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_16:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_8:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_4:
+    // The shared-memory write: ordering against other shared accesses
+    // comes from the explicit commit/wait (DEPBAR) the program issues.
+    Info.opc = ISD::INTRINSIC_VOID;
+    Info.memVT = MVT::i128;
+    Info.flags = MachineMemOperand::MOStore | MachineMemOperand::MOLoad;
+    break;
+  default:
+    return;
+  }
+  Info.ptrVal = I.getArgOperand(0); // The shared-memory address.
+  Infos.push_back(Info);
 }
 
 EVT SASSTargetLowering::getSetCCResultType(const DataLayout &, LLVMContext &Ctx,
@@ -304,29 +412,25 @@ SDValue SASSTargetLowering::LowerFormalArguments(
     report_fatal_error("SASS: only kernels are supported; device function '" +
                        F.getName() + "' must be inlined");
 
-  // Each parameter takes a 4- or 8-byte slot at its natural alignment; the
-  // sass-dec assembler lays out `#fn` parameters the same way.
+  // Parameter offsets in constant bank 0 (SASS::paramLayout); the sass-dec
+  // assembler lays out the printed `#fn` parameters the same way.
   auto *FI = MF.getInfo<SASSFunctionInfo>();
-  SmallVector<unsigned, 8> Offsets;
-  unsigned Off = 0;
-  for (const Argument &A : F.args()) {
-    if (A.hasByValAttr())
-      report_fatal_error("SASS: by-value aggregate kernel parameters are not "
-                         "supported");
-    uint64_t Size = F.getDataLayout().getTypeAllocSize(A.getType());
-    if (Size > 8)
-      report_fatal_error("SASS: kernel parameters wider than 8 bytes are not "
-                         "supported");
-    unsigned Slot = Size > 4 ? 8 : 4;
-    Off = alignTo(Off, Slot);
-    Offsets.push_back(Off);
-    FI->ParamSizes.push_back(Slot);
-    Off += Slot;
+  unsigned ParamBase = DAG.getSubtarget<SASSSubtarget>().paramBase();
+  SmallVector<SASS::ParamSlot, 8> Slots = SASS::paramLayout(F, ParamBase);
+  for (const SASS::ParamSlot &S : Slots) {
+    FI->ParamSizes.push_back(S.Size);
+    FI->ParamAligns.push_back(S.Explicit ? S.Align : 0);
   }
 
-  unsigned ParamBase = DAG.getSubtarget<SASSSubtarget>().paramBase();
   for (const ISD::InputArg &In : Ins) {
-    unsigned CBOff = ParamBase + Offsets[In.getOrigArgIndex()] + In.PartOffset;
+    // SASSLowerKernelArgs rewrote every access to a by-value parameter as a
+    // constant bank 0 load; the pointer itself is dead.
+    if (In.Flags.isByVal()) {
+      InVals.push_back(DAG.getUNDEF(In.VT));
+      continue;
+    }
+    unsigned CBOff =
+        ParamBase + Slots[In.getOrigArgIndex()].Offset + In.PartOffset;
     SDValue OffV = DAG.getTargetConstant(CBOff, DL, MVT::i32);
     EVT ArgVT = In.ArgVT;
     if (In.VT == MVT::i64 || In.VT == MVT::f32) {
@@ -391,10 +495,18 @@ SDValue SASSTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) const 
     return lowerFunnelShift(Op, DAG);
   case ISD::GlobalAddress:
     return lowerGlobalAddress(Op, DAG);
+  case ISD::ADDRSPACECAST: {
+    auto *ASC = cast<AddrSpaceCastSDNode>(Op);
+    if (ASC->getSrcAddressSpace() == 5 || ASC->getDestAddressSpace() == 5)
+      return lowerLocalAddrSpaceCast(Op, DAG);
+    return lowerConstAddrSpaceCast(Op, DAG);
+  }
   case ISD::STORE:
     return lowerVectorStore(Op, DAG);
   default:
-    llvm_unreachable("unexpected custom lowering");
+    if (SDValue V = lowerPTXOp(Op, DAG))
+      return V;
+    return lowerTypesOp(Op, DAG);
   }
 }
 

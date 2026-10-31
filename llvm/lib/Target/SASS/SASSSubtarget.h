@@ -37,6 +37,12 @@ public:
   unsigned paramBase() const { return HasBlackwellISA ? 0x380 : 0x210; }
   /// Constant bank 0 offset of the default global memory descriptor.
   unsigned globalDescOffset() const { return HasBlackwellISA ? 0x358 : 0x208; }
+  /// Constant bank 0 offset of the initial per-thread stack pointer (a
+  /// local-window address; the frame lies below it).
+  unsigned stackPtrOffset() const { return HasBlackwellISA ? 0x37c : 0x28; }
+  /// Constant bank 0 offset of the 64-bit generic address of the local
+  /// window: generic = base + local address.
+  unsigned localBaseOffset() const { return HasBlackwellISA ? 0x2f8 : 0x20; }
 
   const SASSInstrInfo *getInstrInfo() const override { return &InstrInfo; }
   const SASSFrameLowering *getFrameLowering() const override {

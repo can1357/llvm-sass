@@ -49,6 +49,12 @@ def kernels(sass: str) -> dict[str, str]:
 
 # Assembler arch -> (clang --cuda-gpu-arch, llc -mcpu). GB10's sm_121 runs
 # the sm_120 ISA; the cubin is tagged sm_121.
+# nvcc --use_fast_math is -ftz=true -prec-div=false -prec-sqrt=false plus the
+# __expf-style intrinsics for libm calls: afn on every call and division,
+# preserve-sign denormals, and the macro CUDA's math headers key on. Unlike
+# clang's -ffast-math it does not reassociate.
+FAST_MATH = ["-fapprox-func", "-fcuda-flush-denormals-to-zero", "-D__USE_FAST_MATH__"]
+
 ARCHES = {"sm90": ("sm_90", "sm_90"), "sm120": ("sm_120", "sm_120"),
           "sm121": ("sm_120", "sm_121")}
 
@@ -60,6 +66,9 @@ def main() -> int:
     ap.add_argument("--arch", default="sm121", choices=sorted(ARCHES),
                     help="sm90: H100/H200; sm120: RTX 50; sm121: GB10")
     ap.add_argument("--llc-args", default="", help="extra llc flags, space separated")
+    ap.add_argument("--fast-math", action="store_true",
+                    help="as nvcc --use_fast_math: approximate math functions, "
+                         "division and square root (MUFU), denormals flushed (.FTZ)")
     opts = ap.parse_args()
     opts.out.mkdir(parents=True, exist_ok=True)
     stem = opts.src.stem
@@ -68,8 +77,11 @@ def main() -> int:
     ll = opts.src
     if opts.src.suffix == ".cu":
         ll = opts.out / f"{stem}.ll"
+        # Without a CUDA install clang cannot infer the PTX ISA version, which
+        # gates builtins such as __nvvm_shfl_sync_*.
         run([CLANG, "-x", "cuda", "--cuda-device-only", "-nocudainc", "-nocudalib",
-             f"--cuda-gpu-arch={gpu_arch}", "-fcuda-short-ptr", "-O3", "-S", "-emit-llvm",
+             f"--cuda-gpu-arch={gpu_arch}", "-Xclang", "-target-feature", "-Xclang", "+ptx87",
+             "-fcuda-short-ptr", "-O3", "-S", "-emit-llvm", *FAST_MATH * opts.fast_math,
              "-include", str(ROOT / "kernels" / "cuda_min.h"), str(opts.src), "-o", str(ll)])
     sass_path = opts.out / f"{stem}.sass"
     run([str(LLC), "-march=sass", f"-mcpu={cpu}", "-O3", *opts.llc_args.split(), str(ll),

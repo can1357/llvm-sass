@@ -2,6 +2,7 @@
 
 #include "SASSInstPrinter.h"
 #include "SASSBaseInfo.h"
+#include "SASSGMMAFlags.h"
 #include "SASSMCTargetDesc.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCExpr.h"
@@ -42,6 +43,19 @@ void SASSInstPrinter::printInst(const MCInst *MI, uint64_t Address,
   std::string Text;
   raw_string_ostream TOS(Text);
   printInstruction(MI, Address, TOS);
+  if (MI->getFlags() & SASS::InstFlagFTZ) {
+    // .FTZ follows the opcode and its rounding/condition modifiers but
+    // precedes the predicate combiner and .SAT: FFMA.FTZ.SAT,
+    // FSETP.GEU.FTZ.AND.
+    StringRef Op = StringRef(Text).ltrim();
+    Op = Op.take_until([](char C) { return C == ' '; });
+    size_t At = Op.rfind(".AND");
+    if (At == StringRef::npos)
+      At = Op.find(".SAT");
+    if (At == StringRef::npos)
+      At = Op.size();
+    Text.insert(Op.data() - Text.data() + At, ".FTZ");
+  }
   O << StringRef(Text).ltrim();
   printAnnotation(O, Annot);
 }
@@ -57,17 +71,77 @@ void SASSInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
     MAI.printExpr(O, *Op.getExpr());
 }
 
-void SASSInstPrinter::printGroupReg(MCRegister Reg, raw_ostream &O) {
+void SASSInstPrinter::printGroupReg(MCRegister Reg, raw_ostream &O,
+                                    unsigned Count) {
+  // Tuples have only 32-bit leaves (sub0, sub1, ...), contiguous from the
+  // base register's encoding.
+  SmallVector<MCRegister, 64> Subs;
+  for (MCRegister Sub : MRI.subregs(Reg))
+    if (MRI.subregs(Sub).empty())
+      Subs.push_back(Sub);
+  llvm::sort(Subs, [&](MCRegister A, MCRegister B) {
+    return MRI.getEncodingValue(A) < MRI.getEncodingValue(B);
+  });
+  if (Count && Count < Subs.size())
+    Subs.resize(Count);
   O << '{';
-  bool First = true;
-  for (unsigned Idx : {SASS::sub0, SASS::sub1, SASS::sub2, SASS::sub3}) {
-    MCRegister Sub = MRI.getSubReg(Reg, Idx);
-    if (!Sub)
-      break;
-    O << (First ? "" : ",") << getRegisterName(Sub);
-    First = false;
-  }
+  for (auto [I, Sub] : enumerate(Subs))
+    O << (I ? "," : "") << getRegisterName(Sub);
   O << '}';
+}
+
+void SASSInstPrinter::printGMMAFlags(const MCInst *MI, unsigned OpNo,
+                                     raw_ostream &O) {
+  using namespace SASS::GMMA;
+  static const char *const FmtName[] = {"F16", "BF16", "TF32", "E4M3", "E5M2"};
+  unsigned F = MI->getOperand(OpNo).getImm();
+  O << (isQ(F) ? "QGMMA" : "HGMMA") << ".64x" << n(F) << 'x' << k(F) << '.'
+    << (f32(F) ? "F32" : "F16");
+  if (isQ(F))
+    O << '.' << FmtName[fmtA(F)] << '.' << FmtName[fmtB(F)];
+  else if (fmtA(F) != SASS::GMMA::F16)
+    O << '.' << FmtName[fmtA(F)];
+  // RS forms negate A with a '-' on the register group (printGMMAFrag).
+  bool RS = MI->getOpcode() == SASS::GMMA_RS || MI->getOpcode() == SASS::GMMA_RS_Z;
+  if ((F & NegA) && !RS)
+    O << ".negA";
+  if (F & NegB)
+    O << ".negB";
+  if (F & TnspA)
+    O << ".tnspA";
+  if (F & TnspB)
+    O << ".tnspB";
+}
+
+void SASSInstPrinter::printGMMAAcc(const MCInst *MI, unsigned OpNo,
+                                   raw_ostream &O) {
+  printGroupReg(MI->getOperand(OpNo).getReg(), O,
+                SASS::GMMA::accRegs(MI->getOperand(1).getImm()));
+}
+
+void SASSInstPrinter::printGMMAFrag(const MCInst *MI, unsigned OpNo,
+                                    raw_ostream &O) {
+  if (MI->getOperand(1).getImm() & SASS::GMMA::NegA)
+    O << '-';
+  printGroupReg(MI->getOperand(OpNo).getReg(), O);
+}
+
+void SASSInstPrinter::printGMMAUP(const MCInst *MI, unsigned OpNo,
+                                  raw_ostream &O) {
+  MCRegister R = MI->getOperand(OpNo).getReg();
+  if (R != SASS::UPT)
+    O << ", " << getRegisterName(R);
+}
+
+void SASSInstPrinter::printGMMAGsb(const MCInst *MI, unsigned OpNo,
+                                   raw_ostream &O) {
+  if (MI->getOperand(OpNo).getImm())
+    O << ", gsb0";
+}
+
+void SASSInstPrinter::printGDesc(const MCInst *MI, unsigned OpNo,
+                                 raw_ostream &O) {
+  O << getRegisterName(MRI.getSubReg(MI->getOperand(OpNo).getReg(), SASS::sub0));
 }
 
 void SASSInstPrinter::printGroup(const MCInst *MI, unsigned OpNo,
@@ -129,6 +203,20 @@ void SASSInstPrinter::printSharedAddr(const MCInst *MI, unsigned OpNo,
   O << '[' << getRegisterName(MI->getOperand(OpNo).getReg());
   printOffset(MI->getOperand(OpNo + 1).getImm(), O);
   O << ']';
+}
+
+void SASSInstPrinter::printRawGlobalAddr(const MCInst *MI, unsigned OpNo,
+                                         raw_ostream &O) {
+  O << '[';
+  printGroupReg(MI->getOperand(OpNo).getReg(), O);
+  printOffset(MI->getOperand(OpNo + 1).getImm(), O);
+  O << ']';
+}
+
+void SASSInstPrinter::printScope(const MCInst *MI, unsigned OpNo,
+                                 raw_ostream &O) {
+  static const char *const Names[] = {"SM", "GPU", "SYS"};
+  O << Names[MI->getOperand(OpNo).getImm()];
 }
 
 void SASSInstPrinter::printOffset(int64_t Off, raw_ostream &O) {

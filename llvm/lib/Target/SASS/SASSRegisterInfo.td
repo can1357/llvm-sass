@@ -60,12 +60,17 @@ foreach I = 0-30 in
 
 // R1 (stack pointer by ABI) and RZ are reserved in SASSRegisterInfo; RZ stays
 // in the class so patterns can name it as a zero source.
-def GPR32 : RegisterClass<"SASS", [i32, f32], 32,
+def GPR32 : RegisterClass<"SASS", [i32, f32, v2f16, v2bf16, f16, bf16], 32,
                           (add (sequence "R%u", 0, 254), RZ)>;
 def GPR64 : RegisterClass<"SASS", [i64], 64, (sequence "RD%u", 0, 126)>;
 def GPR128 : RegisterClass<"SASS", [v4i32, v4f32], 128,
                            (sequence "RQ%u", 0, 62)>;
-def PRED : RegisterClass<"SASS", [i1], 8, (add (sequence "P%u", 0, 6), PT)>;
+// Predicates spill as one byte (SASSRegisterInfo::eliminateFrameIndex).
+def PRED : RegisterClass<"SASS", [i1], 8, (add (sequence "P%u", 0, 6), PT)> {
+  let Size = 8;
+}
 def UGPR32 : RegisterClass<"SASS", [i32], 32,
                            (add (sequence "UR%u", 0, 62), URZ)>;
 def UGPR64 : RegisterClass<"SASS", [i64], 64, (sequence "URD%u", 0, 30)>;
+
+include "SASSRegisterWGMMA.td"

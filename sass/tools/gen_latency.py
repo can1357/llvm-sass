@@ -9,8 +9,10 @@ every latency mnemonic the backend emits, this writes:
   mnemonics go at the end so existing ids (and encoded TSFlags) stay put.
 - `SASSLatencyTables.inc`: one `LatencyTables` per architecture
   (`SM90Latencies`, `SM120Latencies`) with `TrueGPR`, `TruePred`,
-  `TruePredGuard` and `TrueUGPR` arrays indexed `[producer][consumer]`, in
-  cycles. A mnemonic absent from an architecture's dump has zero rows.
+  `TruePredGuard` and `TrueUGPR` arrays indexed `[producer][consumer]`, and
+  `AntiGPR` indexed `[reader][writer]` (cycles a writer must wait after an
+  instruction that reads the register over several cycles, such as HMMA).
+  A mnemonic absent from an architecture's dump has zero rows.
 
 Cells are the maximum over operand roles: a consumer that reads a GPR in any
 slot waits the slowest slot's latency. Predicate guards (`Pg`) and predicate
@@ -28,7 +30,9 @@ from parse_latencies import Latencies  # noqa: E402
 
 MNEMONICS = """IADD IADD3 IMAD LOP3 SHF ISETP SEL VIMNMX MOV FADD FMUL FFMA FSETP FSEL
 FMNMX I2FP F2I MUFU LDG STG LD ST LDS STS LDC LDCU S2R S2UR BAR BRA EXIT PLOP3
-PRMT POPC FLO SHFL LEA NOP R2UR UIADD3 UMOV ULDC""".split()
+PRMT POPC FLO SHFL LEA NOP R2UR UIADD3 UMOV ULDC HMMA LDSM STSM HFMA2
+FSET IDP BREV REDUX IABS
+HGMMA QGMMA WARPGROUP VOTEU USETMAXREG WARPSYNC""".split()
 
 # Table set name in the .inc -> latency dump in sass-dec.
 ARCHES = {"SM90": "sm_90_latencies.txt", "SM120": "sm120_latencies.txt"}
@@ -44,13 +48,14 @@ def cell(value: str) -> int:
     return 0  # ORDERED_ZERO and friends: no fixed wait
 
 
-def matrix(lat: Latencies, res: str, roles: set[str] | None, exclude: set[str] = frozenset()) -> list[list[int]]:
+def matrix(lat: Latencies, res: str, roles: set[str] | None, exclude: set[str] = frozenset(),
+           dep: str = "TRUE") -> list[list[int]]:
     out = []
     for prod in MNEMONICS:
         row = []
         for cons in MNEMONICS:
             best = 0
-            for value, _col, col_roles, _row in lat.lookup("TRUE", res, prod, cons, None):
+            for value, _col, col_roles, _row in lat.lookup(dep, res, prod, cons, None):
                 wanted = set(col_roles) - exclude if roles is None else set(col_roles) & roles
                 if wanted:
                     best = max(best, cell(value))
@@ -77,14 +82,16 @@ def main() -> None:
            "  uint8_t TruePred[NumLatMnem][NumLatMnem];\n"
            "  uint8_t TruePredGuard[NumLatMnem][NumLatMnem];\n"
            "  uint8_t TrueUGPR[NumLatMnem][NumLatMnem];\n"
+           "  uint8_t AntiGPR[NumLatMnem][NumLatMnem];\n"
            "};\n"]
     for name, dump in ARCHES.items():
         lat = Latencies(str(ROOT / "sass-dec" / dump))
         tables = [matrix(lat, "GPR", None), matrix(lat, "PRED", None, exclude={"Pg"}),
-                  matrix(lat, "PRED", {"Pg"}), matrix(lat, "UGPR", None)]
+                  matrix(lat, "PRED", {"Pg"}), matrix(lat, "UGPR", None),
+                  matrix(lat, "GPR", None, dep="ANTI")]
         inc.append(f"static const LatencyTables {name}Latencies = {{\n" + ",\n".join(map(emit_matrix, tables)) + "};\n")
         nz = [sum(v > 0 for row in m for v in row) for m in tables]
-        print(f"{name}: nonzero cells GPR {nz[0]}, Pred {nz[1]}, PredGuard {nz[2]}, UGPR {nz[3]}")
+        print(f"{name}: nonzero cells GPR {nz[0]}, Pred {nz[1]}, PredGuard {nz[2]}, UGPR {nz[3]}, Anti {nz[4]}")
     (OUT / "SASSLatencyTables.inc").write_text("\n".join(inc))
 
 

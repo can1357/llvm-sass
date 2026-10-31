@@ -75,11 +75,16 @@ unsigned tableLat(const LatencyTables &L, unsigned Prod, unsigned Cons,
   return V ? V : 6;
 }
 
-/// Worst-case latency of a fixed result over every consumer, used when the
-/// consumer is in another block.
-unsigned drainLat(const LatencyTables &L, unsigned Prod, RegKind K) {
+/// Worst-case latency of a fixed result over the consumer mnemonics in
+/// \p Consumers (a bit per LatMnemonic present in the function), used when
+/// the consumer is in another block.
+unsigned drainLat(const LatencyTables &L, uint64_t Consumers, unsigned Prod,
+                  RegKind K) {
+  static_assert(NumLatMnem <= 64);
   unsigned V = 6;
   for (unsigned C = 0; C < NumLatMnem; ++C) {
+    if (!(Consumers >> C & 1))
+      continue;
     if (K == RegKind::Pred) {
       V = std::max<unsigned>(V, L.TruePred[Prod][C]);
       V = std::max<unsigned>(V, L.TruePredGuard[Prod][C]);
@@ -160,6 +165,11 @@ private:
   const SASSInstrInfo *TII = nullptr;
   /// Fixed latencies of the function's architecture.
   const LatencyTables *Lat = nullptr;
+  /// LatMnemonic bits of the instructions in the function.
+  uint64_t Consumers = 0;
+  /// The function has tensor-core instructions, whose results can take
+  /// longer than one stall field: blocks drain before their terminators.
+  bool DrainBeforeTerminators = false;
   /// Highest write scoreboard for results: below SASS::AsyncCopySB when the
   /// function commits async copies to it.
   unsigned LastResultSB = LastWriteSB;
@@ -235,7 +245,8 @@ template <typename SlotVec> static void setReuseBits(SlotVec &Out) {
 RegKind SASSControlCodes::kindOf(Register R, bool IsGuard) const {
   if (SASS::PREDRegClass.contains(R))
     return IsGuard ? RegKind::PredGuard : RegKind::Pred;
-  if (SASS::UGPR32RegClass.contains(R) || SASS::UGPR64RegClass.contains(R))
+  if (SASS::UGPR32RegClass.contains(R) || SASS::UGPR64RegClass.contains(R) ||
+      SASS::UGPR128RegClass.contains(R))
     return RegKind::UGPR;
   return RegKind::GPR;
 }
@@ -244,7 +255,35 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
                                        SASSFunctionInfo *Commit) {
   unsigned NumUnits = TRI->getNumRegUnits();
   SmallVector<FixedDef, 0> Fixed(NumUnits);
+  // Last read of each register unit by a tensor-core instruction, which
+  // collects its sources over several cycles: a later writer of the unit
+  // waits AntiGPR[reader][writer] cycles after it issued.
+  struct SlowRead {
+    int Issue = Never;
+    unsigned Mnem = 0;
+  };
+  SmallVector<SlowRead, 0> Slow(NumUnits);
+  auto MaxAnti = [&](unsigned Reader) {
+    unsigned V = 1;
+    for (unsigned W = 0; W < NumLatMnem; ++W)
+      V = std::max<unsigned>(V, Lat->AntiGPR[Reader][W]);
+    return V;
+  };
   int SBSet[6] = {Never, Never, Never, Never, Never, Never};
+  // wgmma and setmaxnreg (ptxas's GMMA_SCOREBOARD, GMMA_GROUP_SCOREBOARD
+  // and RPC tables): GMMA issues 6 cycles after WARPGROUP.ARRIVE; DEPBAR,
+  // EXIT and the next gsb0 GMMA 3 after a gsb0 GMMA; USETMAXREG 9 after the
+  // previous instruction. NextReq: scoreboard the next instruction waits on.
+  int LastArrive = Never, LastGsb = Never, PrevIssue = Never;
+  unsigned NextReq = 0;
+  auto IsGMMA = [](unsigned Opc) {
+    return Opc == SASS::GMMA_SS || Opc == SASS::GMMA_RS ||
+           Opc == SASS::GMMA_SS_Z || Opc == SASS::GMMA_RS_Z;
+  };
+  auto HasGsb = [&](const MachineInstr &MI) {
+    return IsGMMA(MI.getOpcode()) &&
+           MI.getOperand(MI.getDesc().getNumOperands() - 3).getImm();
+  };
   int T = 0; // Issue cycle of the next instruction.
   // Expected latency of the slowest result pending on each scoreboard.
   int SBLat[6] = {0, 0, 0, 0, 0, 0};
@@ -285,12 +324,13 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
     unsigned Total = P.Stall + N;
     P.Stall = std::min(Total, MaxStall);
     for (Total -= P.Stall; Total; Total -= Out.back().C.Stall) {
-      if (!Before)
+      // Padding at the block end only runs on fallthrough.
+      if (!Before && MBB.getFirstTerminator() != MBB.end())
         report_fatal_error("SASS: block-exit drain exceeds the stall field");
       MachineInstr *Nop = nullptr;
       if (Commit)
-        Nop = BuildMI(MBB, Before->getIterator(), DebugLoc(),
-                      TII->get(SASS::NOP))
+        Nop = BuildMI(MBB, Before ? Before->getIterator() : MBB.end(),
+                      DebugLoc(), TII->get(SASS::NOP))
                   .addReg(SASS::PT)
                   .addImm(0);
       SASSCtrl NC;
@@ -299,9 +339,36 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
     }
   };
 
+  // Cycle by which every fixed result is usable, every scoreboard set and
+  // every slow read done: blocks are left in that state.
+  auto DrainReady = [&] {
+    int Ready = T;
+    for (const SlowRead &R : Slow)
+      if (R.Issue != Never)
+        Ready = std::max<int>(Ready, R.Issue + MaxAnti(R.Mnem));
+    for (const FixedDef &F : Fixed)
+      if (F.Issue != Never)
+        Ready = std::max<int>(Ready, F.Issue + drainLat(*Lat, Consumers, F.Mnem, F.K));
+    for (int Set : SBSet)
+      Ready = std::max(Ready, Set + SBSetDelay);
+    Ready = std::max({Ready, LastArrive + 6, LastGsb + 3});
+    return Ready;
+  };
+
+  bool Drained = false;
   for (MachineInstr &MI : MBB) {
     if (MI.isMetaInstruction())
       continue;
+    // Tensor-core results take longer than a stall field: wait before the
+    // branch, padding with NOPs, rather than in its stall.
+    if (DrainBeforeTerminators && MI.isTerminator() && !Drained) {
+      Drained = true;
+      int Ready = DrainReady();
+      if (Ready > T && !Out.empty()) {
+        Delay(Ready - T, &MI);
+        T = Ready;
+      }
+    }
     const MCInstrDesc &D = MI.getDesc();
     unsigned M = SASS::latMnem(D);
     int Guard = MI.findFirstPredOperandIdx();
@@ -317,11 +384,42 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
         Req |= S.Wr[U];
         if (MO.isDef())
           Req |= S.Rd[U]; // WAR against a late reader.
+        if (MO.isDef() && Slow[U].Issue != Never)
+          Need = std::max<int>(Need, Slow[U].Issue +
+                                         Lat->AntiGPR[Slow[U].Mnem][M]);
         const FixedDef &F = Fixed[U];
         if (F.Issue != Never)
           Need = std::max<int>(Need, F.Issue + useLat(*Lat, F, M, K));
       }
     }
+    unsigned Opc = MI.getOpcode();
+    if (IsGMMA(Opc))
+      Need = std::max(Need, LastArrive + 6);
+    if (HasGsb(MI) || Opc == SASS::WARPGROUP_DEPBAR || MI.isReturn())
+      Need = std::max(Need, LastGsb + 3);
+    if (Opc == SASS::WARPGROUP_ARRIVE) {
+      // Registers a GMMA reads must be written back before the arrive
+      // (TABLE_TRUE(GPR) column GMMA_SB): every pending result.
+      for (unsigned U = 0; U < NumUnits; ++U) {
+        Req |= S.Wr[U];
+        const FixedDef &F = Fixed[U];
+        if (F.Issue == Never)
+          continue;
+        unsigned L = 8;
+        for (unsigned Cn = 0; Cn < NumLatMnem; ++Cn)
+          L = std::max<unsigned>(L, Lat->TrueGPR[F.Mnem][Cn] + 2);
+        Need = std::max<int>(Need, F.Issue + L);
+      }
+    }
+    if (Opc == SASS::USETMAXREG_DEALLOC || Opc == SASS::USETMAXREG_TRY_ALLOC) {
+      Need = std::max(Need, PrevIssue + 9);
+      // Freed registers must have no results in flight.
+      if (Opc == SASS::USETMAXREG_DEALLOC)
+        for (unsigned U = 0; U < NumUnits; ++U)
+          Req |= S.Wr[U] | S.Rd[U];
+    }
+    Req |= NextReq;
+    NextReq = 0;
     for (unsigned SB = 0; SB < 6; ++SB)
       if (Req & (1u << SB))
         Need = std::max(Need, SBSet[SB] + SBSetDelay);
@@ -363,6 +461,23 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
       C.Wr = SASS::AsyncCopySB;
       SBSet[C.Wr] = T;
     }
+    // USETMAXREG.DEALLOC completes on a scoreboard the next instruction
+    // waits on (as ptxas emits it).
+    if (MI.getOpcode() == SASS::USETMAXREG_DEALLOC) {
+      bool WaitFirst = false;
+      C.Wr = PickWriteSB(WaitFirst);
+      if (WaitFirst)
+        C.Req |= 1u << C.Wr;
+      SBSet[C.Wr] = T;
+      SBLat[C.Wr] = resultLat(M);
+      NextReq = 1u << C.Wr;
+    }
+    // A bulk-copy commit counts on SB0; DEPBAR.LE SB0, N waits for it
+    // (cp.async.bulk.wait_group).
+    if (MI.getOpcode() == SASS::UTMACMDFLUSH) {
+      C.Rd = ReadSB;
+      SBSet[ReadSB] = T;
+    }
     if (SASS::readsLate(D) && HasLateSrc) {
       C.Rd = ReadSB;
       SBSet[ReadSB] = T;
@@ -374,8 +489,15 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
       RegKind K = kindOf(MO.getReg(), false);
       bool Wide = SASS::GPR64RegClass.contains(MO.getReg()) ||
                   SASS::GPR128RegClass.contains(MO.getReg());
+      // GMMA results land asynchronously, behind WARPGROUP.DEPBAR.
+      if (IsGMMA(Opc) && MO.isDef()) {
+        for (unsigned U : units(MO.getReg()))
+          Fixed[U] = FixedDef();
+        continue;
+      }
       for (unsigned U : units(MO.getReg())) {
         if (MO.isDef()) {
+          Slow[U] = SlowRead();
           if (C.Wr != 7) {
             S.Wr[U] = 1u << C.Wr;
             Fixed[U] = FixedDef();
@@ -384,21 +506,22 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
           }
         } else if (C.Rd != 7 && (int)I != Guard) {
           S.Rd[U] |= 1u << ReadSB;
+        } else if (M == LAT_HMMA && (int)I != Guard) {
+          Slow[U] = {T, M};
         }
       }
     }
+    if (MI.getOpcode() == SASS::WARPGROUP_ARRIVE)
+      LastArrive = T;
+    if (HasGsb(MI))
+      LastGsb = T;
+    PrevIssue = T;
     C.Stall = std::max(1u, SASS::minStall(D));
     Out.push_back({&MI, C});
     T += C.Stall;
   }
 
-  // Leave the block with every fixed result usable and every scoreboard set.
-  int Ready = T;
-  for (const FixedDef &F : Fixed)
-    if (F.Issue != Never)
-      Ready = std::max<int>(Ready, F.Issue + drainLat(*Lat, F.Mnem, F.K));
-  for (int Set : SBSet)
-    Ready = std::max(Ready, Set + SBSetDelay);
+  int Ready = DrainReady();
   if (Ready > T && !Out.empty())
     Delay(Ready - T, nullptr);
 
@@ -421,6 +544,12 @@ bool SASSControlCodes::runOnMachineFunction(MachineFunction &MF) {
   TRI = ST.getRegisterInfo();
   TII = ST.getInstrInfo();
   Lat = ST.hasBlackwellISA() ? &SM120Latencies : &SM90Latencies;
+  Consumers = 0;
+  for (const MachineBasicBlock &B : MF)
+    for (const MachineInstr &MI : B)
+      if (!MI.isMetaInstruction())
+        Consumers |= uint64_t(1) << SASS::latMnem(MI.getDesc());
+  DrainBeforeTerminators = Consumers >> LAT_HMMA & 1;
   unsigned NumUnits = TRI->getNumRegUnits();
   static_assert(SASS::AsyncCopySB == LastWriteSB);
   LastResultSB = LastWriteSB;

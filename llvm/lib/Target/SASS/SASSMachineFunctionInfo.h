@@ -28,6 +28,9 @@ public:
   /// Byte size of each kernel parameter slot, in order, as laid out in
   /// the constant bank 0 parameter block (set by SASSTargetLowering).
   SmallVector<unsigned, 8> ParamSizes;
+  /// Alignment printed as `p<size:align>` for by-value aggregates and other
+  /// parameters wider than 8 bytes; 0 for the implicit 4/8-byte slots.
+  SmallVector<unsigned, 8> ParamAligns;
 
   /// Control words assigned by SASSControlCodes, read by SASSAsmPrinter.
   DenseMap<const MachineInstr *, SASSCtrl> Ctrl;

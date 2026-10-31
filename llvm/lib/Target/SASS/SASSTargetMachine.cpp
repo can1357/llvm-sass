@@ -48,10 +48,19 @@ public:
   // GEPs so loop-invariant address bases stay shared and the constants fold
   // into [R+imm] operands; finally vectorize adjacent accesses.
   void addIRPasses() override {
+    addPass(createSASSInlineCallsPass());
+    addPass(createSASSExpandInlinePTXPass());
+    addPass(createSASSLowerInlinePTXPass());
+    addPass(createSASSLowerMathPass());
+    // Before loop strength reduction, which rewrites the byte extracts of
+    // `x + i` as separately shifted induction variables.
+    if (getOptLevel() != CodeGenOptLevel::None)
+      addPass(createSASSLiftIdiomsPass());
     addPass(createSASSLowerKernelArgsPass());
     bool Opt = getOptLevel() != CodeGenOptLevel::None;
     if (Opt)
       addPass(createSROAPass(/*PreserveCFG=*/true, /*AggregateToVector=*/true));
+    addPass(createSASSLowerAllocaPass());
     addPass(createInferAddressSpacesPass());
     addPass(createSASSLowerMemcpyPass());
     if (Opt) {
@@ -78,6 +87,7 @@ public:
   }
 
   void addPreRegAlloc() override {
+    addPass(createSASSExpandWGMMAPass());
     if (getOptLevel() != CodeGenOptLevel::None) {
       addPass(createSASSAsyncCopyPass());
       addPass(createSASSUniformAddrPass());
@@ -93,7 +103,10 @@ public:
   }
 
   // Control codes depend on the final instruction order and block layout.
-  void addPreEmitPass2() override { addPass(createSASSControlCodesPass()); }
+  void addPreEmitPass2() override {
+    addPass(createSASSWGMMAHazardsPass());
+    addPass(createSASSControlCodesPass());
+  }
 };
 } // namespace
 
@@ -120,7 +133,15 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeSASSTarget() {
   initializeSASSControlCodesPass(PR);
   initializeSASSDAGToDAGISelLegacyPass(PR);
   initializeSASSLowerKernelArgsPass(PR);
+  initializeSASSLowerAllocaPass(PR);
+  initializeSASSLowerInlinePTXPass(PR);
+  initializeSASSLowerMathPass(PR);
+  initializeSASSLiftIdiomsPass(PR);
+  initializeSASSExpandInlinePTXPass(PR);
   initializeSASSPreRASchedPass(PR);
   initializeSASSUniformAddrPass(PR);
+  initializeSASSExpandWGMMAPass(PR);
+  initializeSASSWGMMAHazardsPass(PR);
   initializeSASSLowerMemcpyPass(PR);
+  initializeSASSInlineCallsPass(PR);
 }

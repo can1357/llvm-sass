@@ -36,6 +36,12 @@ public:
   SDValue LowerCall(CallLoweringInfo &CLI,
                     SmallVectorImpl<SDValue> &InVals) const override;
 
+  /// Memory behaviour of ldmatrix/stmatrix/cp.async intrinsics, so their
+  /// machine instructions carry shared-memory operands for alias analysis.
+  void getTgtMemIntrinsic(SmallVectorImpl<IntrinsicInfo> &Infos,
+                          const CallBase &I, MachineFunction &MF,
+                          unsigned Intrinsic) const override;
+
   /// 64-bit adds (IADD.64) stay on Blackwell and become IADD3/IADD3.X carry
   /// chains on Hopper (SASSInstrInfo::expandAdd64).
   MachineBasicBlock *
@@ -49,22 +55,65 @@ public:
   }
   bool isFMAFasterThanFMulAndFAdd(const MachineFunction &MF,
                                   EVT VT) const override {
-    return VT == MVT::f32;
+    return VT == MVT::f32 || isHalfType(VT);
   }
   bool isFPImmLegal(const APFloat &Imm, EVT VT,
                     bool ForCodeSize) const override {
-    return VT == MVT::f32;
+    return VT == MVT::f32 || VT == MVT::f16 || VT == MVT::bf16;
+  }
+  /// Atomics (SASSISelLoweringTypes.cpp): native ATOM*/RED forms stay, the
+  /// rest become compare-and-swap loops; orderings become fences around a
+  /// relaxed access at the instruction's scope.
+  AtomicExpansionKind
+  shouldExpandAtomicRMWInIR(const AtomicRMWInst *AI) const override;
+  bool shouldInsertFencesForAtomic(const Instruction *I) const override;
+  Instruction *emitLeadingFence(IRBuilderBase &Builder, Instruction *Inst,
+                                AtomicOrdering Ord) const override;
+  Instruction *emitTrailingFence(IRBuilderBase &Builder, Instruction *Inst,
+                                 AtomicOrdering Ord) const override;
+  /// f16/bf16 scalars and their packed pairs (SASSISelLoweringTypes.cpp).
+  static bool isHalfType(EVT VT) {
+    return VT == MVT::f16 || VT == MVT::bf16 || VT == MVT::v2f16 ||
+           VT == MVT::v2bf16;
   }
   bool isLegalAddressingMode(const DataLayout &DL, const AddrMode &AM, Type *Ty,
                              unsigned AS,
                              Instruction *I = nullptr) const override;
+  /// Inline asm register constraints of the canonical wgmma.mma_async calls
+  /// ("r", "f" -> GPR32, "l" -> GPR64; SASSWGMMA.cpp).
+  ConstraintType getConstraintType(StringRef Constraint) const override;
+  std::pair<unsigned, const TargetRegisterClass *>
+  getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
+                               StringRef Constraint, MVT VT) const override;
 
 private:
+  /// Operation actions for f16/bf16 and atomics (SASSISelLoweringTypes.cpp).
+  void initTypeActions();
+  /// Operation actions for nodes behind inline PTX (SASSISelPTX.cpp).
+  void initPTXActions();
+  /// Custom lowering of the nodes initPTXActions marks Custom (FP8
+  /// conversions on i16); null if \p Op is not one of them.
+  SDValue lowerPTXOp(SDValue Op, SelectionDAG &DAG) const;
+  bool replacePTXResults(SDNode *N, SmallVectorImpl<SDValue> &Results,
+                         SelectionDAG &DAG) const;
+  /// Custom lowering of the nodes initTypeActions marks Custom; a null
+  /// SDValue means "expand".
+  SDValue lowerTypesOp(SDValue Op, SelectionDAG &DAG) const;
+  /// Results of illegal-typed nodes from initTypeActions (i16 bitcasts of
+  /// halves, v2f32 -> v2f16 rounding); false if \p N is not one of them.
+  bool replaceTypesResults(SDNode *N, SmallVectorImpl<SDValue> &Results,
+                           SelectionDAG &DAG) const;
   SDValue lowerSETCC64(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerMUL64(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerShift64(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerFunnelShift(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerGlobalAddress(SDValue Op, SelectionDAG &DAG) const;
+  /// Casts to/from addrspace(4) (__constant__ data, kernel parameters):
+  /// diagnoses generic pointers into constant banks; returns \p Op for casts
+  /// it does not own.
+  SDValue lowerConstAddrSpaceCast(SDValue Op, SelectionDAG &DAG) const;
+  /// Local (addrspace 5) <-> generic casts (SASSLocalMemory.cpp).
+  SDValue lowerLocalAddrSpaceCast(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerVectorStore(SDValue Op, SelectionDAG &DAG) const;
 };
 

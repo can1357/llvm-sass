@@ -16,6 +16,9 @@ public:
 
   const MCPhysReg *getCalleeSavedRegs(const MachineFunction *MF) const override;
   BitVector getReservedRegs(const MachineFunction &MF) const override;
+  /// Predicate/uniform-register spills are expanded through scavenged GPRs.
+  bool requiresRegisterScavenging(const MachineFunction &MF) const override;
+  bool requiresFrameIndexScavenging(const MachineFunction &MF) const override;
   bool eliminateFrameIndex(MachineBasicBlock::iterator MI, int SPAdj,
                            unsigned FIOperandNum,
                            RegScavenger *RS = nullptr) const override;

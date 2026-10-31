@@ -1,3 +1,71 @@
+diff --git a/ASSEMBLER_MANUAL.md b/ASSEMBLER_MANUAL.md
+index ff2ef98..88a1223 100644
+--- a/ASSEMBLER_MANUAL.md
++++ b/ASSEMBLER_MANUAL.md
+@@ -52,16 +52,40 @@ CLI: `python -m assembler.sass_asm input.sass [-o out.cubin] [-n kernel] [--dump
+   is computed with natural alignment (≤8 bytes, min 4) from a `param_base` of
+   `0x380`.  Inside the body, `#param(name)` resolves to the parameter's
+   `c[0x0][offset]`.
++- `name<size:align>` gives an explicit alignment instead (by-value structs,
++  `__grid_constant__` objects): the parameter goes to the next offset whose
++  **absolute** const-bank address `param_base + offset` is a multiple of
++  `align`, as ptxas lays them out (on sm_90 a 64-byte aligned `CUtensorMap`
++  after an 8-byte pointer is at `c[0x0][0x240]`).  `EIATTR_KPARAM_INFO`
++  records the offset and `size`.
++- **`#constant(3, name, offset, size[, 0xBYTES])`** declares an object of the
++  module's constant bank 3 (`__constant__` data): the cubin gets a
++  `.nv.constant3` section holding every declared object at its `offset`
++  plus a local `STT_OBJECT` symbol `name` (so `cuModuleGetGlobal` finds it).
++  `BYTES` are the initial contents in memory order, two hex digits per byte,
++  and may be shorter than `size` (the rest is zero).  Code reads it with
++  `LDC Rd, c[0x3][Ra+off]`.
+ - **`#spec_const(NAME)`** resolves to a fixed const-bank slot; the only one
+   defined is `SLOT_DEFAULT_CDESC` = `c[0x0][0x358]`, the per-kernel default
+   cache descriptor used as `desc[...]` for global accesses.
+ - **`#pragma NAME(value)`** sets kernel attributes: `MAXREG_COUNT`,
+-  `SHARED`, `SHADER_TYPE`, `NUM_MBARRIERS`, `MBARRIER_*`.  These flow into
++  `SHARED`, `SHADER_TYPE`, `NUM_MBARRIERS`, `MBARRIER_*`.  `SHARED(n)` is the
++  static shared memory size; the section always includes the 1 KB reserved
++  window, so `SHARED(0)` still emits it (dynamic-shared-only kernels address
++  their window from `0x400 + n`).  These flow into
+   the ELF pragma/metadata.  An explicit `MAXREG_COUNT` is authoritative and
+   sets both the entry REGCOUNT and per-kernel maximum-register metadata; this
+   distinction matters for `USETMAXREG`/PTX `setmaxnreg`, whose CTA-pool
+   accounting starts from that entry allocation.  Without the pragma, the
+   assembler conservatively grows REGCOUNT from decoded GPR operands.
++- **`#pragma STACK_SIZE(n)`** declares `n` bytes of per-thread local memory
++  (stack frame) below the incoming stack pointer, as ptxas reports it in
++  `EIATTR_FRAME_SIZE`/`EIATTR_MIN_STACK_SIZE` (also written to
++  `EIATTR_MAX_STACK_SIZE`).  The code itself loads the stack pointer
++  (`LDC R1, c[0x0][0x28]` on sm_90, `c[0x0][0x37c]` on sm_120), lowers it by
++  `n` and addresses the frame with `LDL`/`STL [R1+off]`; the generic address
++  of local address `a` is `a + c[0x0][0x20]` (64-bit; `c[0x0][0x2f8]` on
++  sm_120).  Without the pragma the frame size is 0.
+ - Layout-sensitive EIATTR lists are generated from the final instruction
+   stream. `EXIT_INSTR_OFFSETS` comes from every `EXIT`, and
+   `INT_WARP_WIDE_INSTR_OFFSETS` comes from every `VOTEU`/`REDUX`.  The legacy
+diff --git a/assembler/__init__.py b/assembler/__init__.py
+index 55ec865..8981989 100644
+--- a/assembler/__init__.py
++++ b/assembler/__init__.py
+@@ -290,6 +290,8 @@ def assemble_kernel(source: str, *, check_deps: bool = True,
+             cb.set_pragma("MAXREG_COUNT", str(k.attributes["MAXREG_COUNT"]))
+         if "SHARED" in k.attributes:
+             cb.set_shared_mem(int(k.attributes["SHARED"]))
++        for c in k.constants:
++            cb.add_constant(c.bank, c.name, c.offset, c.size, c.data)
+         if "SHADER_TYPE" in k.attributes:
+             cb.set_shader_type(int(k.attributes["SHADER_TYPE"]))
+         if "CLUSTER" in k.attributes:
+@@ -300,7 +302,7 @@ def assemble_kernel(source: str, *, check_deps: bool = True,
+                     attr_name in ("NUM_MBARRIERS", "TCGEN05_1CTA_USED",
+                                   "AT_ENTRY_FRAGMENT_TMEM_CTA1",
+                                   "AT_ENTRY_FRAGMENT_TMEM_CTA1_V2",
+-                                  "REGCOUNT",
++                                  "REGCOUNT", "STACK_SIZE",
+                                   )):
+                 cb.set_pragma(attr_name, str(attr_val))
+         return AssembleResult(
 diff --git a/assembler/arch.py b/assembler/arch.py
 index 71822b9..938c05a 100644
 --- a/assembler/arch.py
@@ -46,10 +114,64 @@ index 71822b9..938c05a 100644
  DEFAULT_ARCH = "sm120"
  
 diff --git a/assembler/operand.py b/assembler/operand.py
-index 4bcb59d..f6edf0a 100644
+index 4bcb59d..1a36c6c 100644
 --- a/assembler/operand.py
 +++ b/assembler/operand.py
-@@ -97,17 +97,16 @@ class Operand:
+@@ -33,12 +33,26 @@ class ParamDecl:
+     name: str
+     size: int = 4
+     ordinal: int = 0
++    # Explicit alignment from `p<size:align>` (by-value aggregates,
++    # __grid_constant__ objects): aligns the absolute const-bank offset.
++    align: Optional[int] = None
+ 
+     @property
+     def cbank_offset(self) -> int:
+         return self.ordinal * 0  # filled later by layout
+ 
+ 
++@dataclass
++class ConstantDecl:
++    """`#constant(bank, name, offset, size[, bytes])`: a named object in a
++    module constant bank (`.nv.constant<bank>`), `data` its leading bytes."""
++    bank: int
++    name: str
++    offset: int
++    size: int
++    data: bytes = b""
++
++
+ @dataclass
+ class KernelDecl:
+     name: str
+@@ -46,14 +60,22 @@ class KernelDecl:
+     attributes: dict[str, str | int] = field(default_factory=dict)
+     instructions: list[ParsedInstruction] = field(default_factory=list)
+     param_base: int = field(default_factory=lambda: arch.current().param_base)
++    constants: list[ConstantDecl] = field(default_factory=list)
+ 
+     def layout_params(self) -> None:
+         off = 0
+         for p in self.params:
+-            # align to at least 4, but also to natural alignment (size up to 8)
+-            align = min(p.size, 8)
+-            align = max(align, 4)
+-            off = (off + align - 1) & ~(align - 1)
++            if p.align:
++                # Explicit alignment applies to the absolute bank offset, as
++                # ptxas places a 64-byte aligned CUtensorMap at c[0x0][0x2c0]
++                # behind sm90's 0x210 parameter base.
++                a = p.align
++                off = ((self.param_base + off + a - 1) & ~(a - 1)) - self.param_base
++            else:
++                # align to at least 4, but also to natural alignment (size up to 8)
++                align = min(p.size, 8)
++                align = max(align, 4)
++                off = (off + align - 1) & ~(align - 1)
+             p.ordinal = off
+             off += p.size
+ 
+@@ -97,17 +119,16 @@ class Operand:
  
      @staticmethod
      def ureg(name: str, width: int = 32) -> Operand:
@@ -72,7 +194,7 @@ index 4bcb59d..f6edf0a 100644
  
      @staticmethod
 diff --git a/assembler/sass_depcheck.py b/assembler/sass_depcheck.py
-index c572094..97bf575 100644
+index c572094..f026498 100644
 --- a/assembler/sass_depcheck.py
 +++ b/assembler/sass_depcheck.py
 @@ -111,9 +111,10 @@ class Claim:
@@ -158,7 +280,15 @@ index c572094..97bf575 100644
  
  
  class DepChecker:
-@@ -528,6 +559,13 @@ class DepChecker:
+@@ -436,6 +467,7 @@ class DepChecker:
+         self.kernel_name = kernel_name
+         self.diags: list[Diagnostic] = []
+         self._track_count = False   # count lattice only when DEPBAR.LE cnt>0 present
++        self._counted_sbs: set = set()  # targets of DEPBAR.LE with cnt > 0
+ 
+     # -- fixpoint ----------------------------------------------------------
+     def _block_transfer(self, block, infos, in_claims, in_ub):
+@@ -528,6 +560,13 @@ class DepChecker:
              # ---- true-dependency: every use needs covering req ----
              for r in sorted(info.uses | info.guards):
                  for c in claims:
@@ -172,7 +302,7 @@ index c572094..97bf575 100644
                      if c.kind == 'wr' and r in c.regs:
                          if c.sb not in info.req_bits:
                              self._warn(
-@@ -537,6 +575,17 @@ class DepChecker:
+@@ -537,6 +576,17 @@ class DepChecker:
                                  reg=_regname(r), sb=c.sb, prod=c.idx)
                          break   # one covering claim is enough
  
@@ -190,7 +320,7 @@ index c572094..97bf575 100644
              # ---- anti-dependency: defs vs outstanding rd claims ----
              for r in sorted(info.defs | info.def_preds):
                  for c in claims:
-@@ -561,7 +610,8 @@ class DepChecker:
+@@ -561,7 +611,8 @@ class DepChecker:
                          f"is outstanding", sb=sb)
  
              # ---- register claims ----
@@ -200,11 +330,80 @@ index c572094..97bf575 100644
                  # missing_wr_sb: variable-latency result consumed later
                  if self._def_used_later(i, info.defs, infos):
                      self._warn(
+@@ -573,9 +624,13 @@ class DepChecker:
+ 
+             # ---- capacity (only meaningful when DEPBAR.LE partial drains
+             # make the count lattice observable) ----
++            # Only a counted DEPBAR.LE compares a tally, so only its
++            # scoreboards are bounded. The lattice never decrements; for
++            # other scoreboards (binary req waits) the real in-flight count
++            # is limited by the LSU/XU queues, far below the cap.
+             if self._track_count:
+                 for sb, c in ub.items():
+-                    if c > 63:
++                    if c > 63 and sb in self._counted_sbs:
+                         self._warn(i, "sb_capacity",
+                                    f"SB{sb} in-flight upper bound {c} exceeds "
+                                    f"the 6-bit tally cap without a drain", sb=sb)
+@@ -628,10 +683,10 @@ def run_depcheck(db: dict, insts, results, addrs, kernel_name="",
+         info.idx = i
+         infos.append(info)
+     checker = DepChecker(db, kernel_name)
+-    checker._track_count = any(
+-        info is not None and info.mnemonic == "DEPBAR"
+-        and any(c is not None and c > 0 for _, c in info.depbar_targets)
+-        for info in infos)
++    checker._counted_sbs = {
++        sb for info in infos if info is not None and info.mnemonic == "DEPBAR"
++        for sb, c in info.depbar_targets if c is not None and c > 0}
++    checker._track_count = bool(checker._counted_sbs)
+     diags = checker.check(insts, infos, addrs)
+     for d in diags:
+         inst = insts[d.instr_idx]
 diff --git a/assembler/sass_elf.py b/assembler/sass_elf.py
-index acb221d..0d86ee1 100644
+index acb221d..462780b 100644
 --- a/assembler/sass_elf.py
 +++ b/assembler/sass_elf.py
-@@ -466,7 +466,9 @@ class CubinBuilder:
+@@ -301,8 +301,9 @@ class CubinBuilder:
+         self._exit_offsets: list[int] = []
+         self._params: list[tuple[int, int, int]] = []
+         self._pragma_attrs: dict[str, str] = {}
+-        self._shared_mem = 0
++        self._shared_mem: int | None = None
+         self._cluster_dims: tuple[int, int, int] | None = None
++        self._constants: list[tuple[str, int, int, bytes]] = []
+ 
+     def set_code(self, instructions: list[tuple[int, int]],
+                  kernel_name: str = "my_kernel") -> None:
+@@ -320,9 +321,26 @@ class CubinBuilder:
+ 
+     def set_shared_mem(self, size: int) -> None:
+         """Static shared-memory size (bytes) → .nv.shared.<kernel> NOBITS
+-        section so the driver allocates the CTA shared window."""
++        section so the driver allocates the CTA shared window.  Size 0 still
++        emits the section's 0x400-byte reserved window (as nvcc does): a
++        kernel using only dynamic shared memory addresses it from there."""
+         self._shared_mem = size
+ 
++    def add_constant(self, bank: int, name: str, offset: int, size: int,
++                     data: bytes = b"") -> None:
++        """A named object in constant bank 3 (`.nv.constant3`): its data and
++        a local STT_OBJECT symbol, so cuModuleGetGlobal finds it."""
++        if bank != 3:
++            raise ElfError(f"constant {name!r}: only bank 3 is supported")
++        if len(data) > size:
++            raise ElfError(f"constant {name!r}: data exceeds size {size}")
++        if offset + size > 0x10000:
++            raise ElfError(f"constant {name!r}: beyond the 64 KB bank")
++        for other, ooff, osize, _ in self._constants:
++            if offset < ooff + osize and ooff < offset + size:
++                raise ElfError(f"constants {name!r} and {other!r} overlap")
++        self._constants.append((name, offset, size, data))
++
+     def set_cluster_dims(self, dims: tuple[int, int, int] | None) -> None:
+         """Cluster dimensions (x, y, z) → EIATTR_CTA_PER_CLUSTER + EXPLICIT
+         cluster marker, so the driver accepts a cuLaunchKernelEx cluster
+@@ -466,7 +484,9 @@ class CubinBuilder:
  
      # ------------------------------------------------------------------
      def _mangle(self) -> str:
@@ -215,7 +414,7 @@ index acb221d..0d86ee1 100644
  
      # ------------------------------------------------------------------
      def build(self) -> bytes:
-@@ -529,15 +531,17 @@ class CubinBuilder:
+@@ -529,15 +549,17 @@ class CubinBuilder:
          # rejected on Hopper with CUDA_ERROR_NO_BINARY_FOR_GPU).  sm100,
          # sm103 and sm120 share the Blackwell note/compat container ABI.
          _is_blackwell = arch.current().name in (
@@ -236,7 +435,55 @@ index acb221d..0d86ee1 100644
                      flags=SHF_INFO_LINK | SHF_CUDA_RETAIN)
              else:
                  sec(".note.nv.cuver", SHT_NOTE,
-@@ -735,6 +739,11 @@ class CubinBuilder:
+@@ -557,7 +579,7 @@ class CubinBuilder:
+         # after .text — the driver links a kernel's static shared window to
+         # this symbol.
+         sym_shared = None
+-        if self._shared_mem:
++        if self._shared_mem is not None:
+             sym_shared = symtab.add(strtab.add(f".nv.shared.{mn}"),
+                                     STB_LOCAL, STT_SECTION, 0)
+         if tcgen05_cta1:
+@@ -601,6 +623,17 @@ class CubinBuilder:
+                 STB_GLOBAL, STT_NOTYPE, 0, value=0x40)
+         sym_cg = symtab.add(strtab.add(".nv.callgraph"),
+                             STB_LOCAL, STT_SECTION, 0)
++        # .nv.constant3: section symbol + one local object per constant, as
++        # nvcc emits them (cuModuleGetGlobal resolves these names).
++        sym_c3 = None
++        sym_consts: list[int] = []
++        if self._constants:
++            sym_c3 = symtab.add(strtab.add(".nv.constant3"),
++                                STB_LOCAL, STT_SECTION, 0)
++            for name, off, size, _ in self._constants:
++                sym_consts.append(symtab.add(strtab.add(name), STB_LOCAL,
++                                             STT_OBJECT, 0, value=off,
++                                             size=size))
+         # st_other bit 4 = STO_ENTRY (cuobjdump -symbols prints 0x10 as
+         # STO_ENTRY): marks the symbol as a kernel entry point.  Without it
+         # the cubin loads and runs normally, but ncu's counter-enabled replay
+@@ -636,10 +669,16 @@ class CubinBuilder:
+         nv_info = eiattr_regcount(sym_func, self._regcount)
+         if self._shader_type is not None:
+             nv_info += eiattr_shader_type(sym_func, self._shader_type)
+-        # FRAME_SIZE, MIN/MAX_STACK_SIZE use 8-byte payloads (func_sym + value)
+-        nv_info += struct.pack("<BBHII", 4, 0x11, 8, sym_func, 0)  # FRAME_SIZE
+-        nv_info += struct.pack("<BBHII", 4, 0x12, 8, sym_func, 0)  # MIN_STACK_SIZE
+-        nv_info += struct.pack("<BBHII", 4, 0x23, 8, sym_func, 0)  # MAX_STACK_SIZE
++        # FRAME_SIZE, MIN/MAX_STACK_SIZE use 8-byte payloads (func_sym + value).
++        # `#pragma STACK_SIZE(n)`: bytes of per-thread local memory the kernel
++        # carves below the stack pointer (LDC R1, c[0x0][0x28] on sm_90,
++        # c[0x0][0x37c] on sm_120).  ptxas reports a non-recursive kernel's
++        # frame as both FRAME_SIZE and MIN_STACK_SIZE; the driver sizes the
++        # per-thread local memory allocation from them.
++        stack = int(self._pragma_attrs.get("STACK_SIZE", "0"), 0)
++        nv_info += struct.pack("<BBHII", 4, 0x11, 8, sym_func, stack)  # FRAME_SIZE
++        nv_info += struct.pack("<BBHII", 4, 0x12, 8, sym_func, stack)  # MIN_STACK_SIZE
++        nv_info += struct.pack("<BBHII", 4, 0x23, 8, sym_func, stack)  # MAX_STACK_SIZE
+         sec(".nv.info", SHT_CUDA_INFO, content=nv_info)
+ 
+         # 8: .nv.info.<mangled> (per-kernel)
+@@ -735,6 +774,11 @@ class CubinBuilder:
          buf += eiattr_hval(0x19, total_ps)  # CBANK_PARAM_SIZE
          buf += eiattr_param_cbank(sym_c0, param_base, total_ps)  # PARAM_CBANK
          buf += eiattr_sval(0x36, 8 if tcgen05_cta1 else 0)  # SW_WAR
@@ -248,7 +495,7 @@ index acb221d..0d86ee1 100644
          sec(f".nv.info.{mn}", SHT_CUDA_INFO, content=buf,
              flags=SHF_INFO_LINK)
  
-@@ -768,6 +777,16 @@ class CubinBuilder:
+@@ -768,6 +812,16 @@ class CubinBuilder:
                          0x09, 0x00, 0x00, 0x00,
                          0x00, 0x00, 0x00, 0x00,
                      ])
@@ -265,3 +512,166 @@ index acb221d..0d86ee1 100644
              else:
                  compat = bytes([
                      0x02, 0x02, 0x03 if tcgen05_cta1 else 0x01, 0x00,
+@@ -782,6 +836,14 @@ class CubinBuilder:
+         cg = struct.pack("<8i", 0, -1, 0, -2, 0, -3, 0, -4)
+         sec(".nv.callgraph", SHT_CUDA_CALLGRAPH, content=cg, entsize=8)
+ 
++        # 10b: .nv.constant3 (module constant bank 3)
++        if self._constants:
++            c3 = bytearray(max(off + size for _, off, size, _ in self._constants))
++            for _, off, _, data in self._constants:
++                c3[off:off + len(data)] = data
++            sec(".nv.constant3", SHT_PROGBITS, content=bytes(c3),
++                flags=SHF_ALLOC)
++
+         # 11: .text.<mangled>
+         raw = b"".join(struct.pack("<QQ", lo & MASK64, hi & MASK64)
+                        for lo, hi in self._instructions)
+@@ -808,7 +870,7 @@ class CubinBuilder:
+         # the SHF_INFO_LINK bit is what marks it as the real shared image.
+         # nvcc pads the declared size by 0x400 (the CTA shared base window):
+         # 16KB of __shared__ -> a 0x4400 section, so usable = size - 0x400.
+-        if self._shared_mem:
++        if self._shared_mem is not None:
+             sec(f".nv.shared.{mn}", SHT_NOBITS, content=b"\x00" * (self._shared_mem + 0x400),
+                 flags=SHF_WRITE | SHF_ALLOC | SHF_INFO_LINK, align=4, nobits=True)
+ 
+@@ -833,7 +895,8 @@ class CubinBuilder:
+         shmem_sec_name = ".nv.shared.reserved.0"
+         cg_sec_name = ".nv.callgraph"
+         c0_sec_name = f".nv.constant0.{mn}"
+-        shared_sec_name = f".nv.shared.{mn}" if self._shared_mem else None
++        shared_sec_name = (f".nv.shared.{mn}" if self._shared_mem is not None
++                           else None)
+ 
+         for i, s in enumerate(secs):
+             if s.name == text_sec_name:
+@@ -863,6 +926,11 @@ class CubinBuilder:
+         symtab.entries[sym_cg].st_shndx = cg_sec_idx
+         symtab.entries[sym_func].st_shndx = text_sec_idx
+         symtab.entries[sym_c0].st_shndx = c0_sec_idx
++        if sym_c3 is not None:
++            c3_sec_idx = next(i for i, s in enumerate(secs)
++                              if s.name == ".nv.constant3")
++            for sym in (sym_c3, *sym_consts):
++                symtab.entries[sym].st_shndx = c3_sec_idx
+         if sym_shared is not None:
+             symtab.entries[sym_shared].st_shndx = shared_sec_idx
+             # The .nv.shared.<kernel> section's sh_info must point at the
+diff --git a/assembler/sass_parser.py b/assembler/sass_parser.py
+index 0ffc54f..0f85a9c 100644
+--- a/assembler/sass_parser.py
++++ b/assembler/sass_parser.py
+@@ -6,7 +6,8 @@ from .operand import Operand, OperandKind, ParsedInstruction, Sched
+ from . import arch
+ 
+ # --- Token types ---
+-from .operand import Operand, OperandKind, ParsedInstruction, Sched, ParamDecl, KernelDecl
++from .operand import (Operand, OperandKind, ParsedInstruction, Sched, ParamDecl,
++                      KernelDecl, ConstantDecl)
+ 
+ # Named const-bank slots, resolved per-arch (arch.ARCHES[*].default_cdesc):
+ #   SLOT_DEFAULT_CDESC — the default cache descriptor the driver plants for
+@@ -22,6 +23,7 @@ TOKENS = [
+     ("PARAM_DIRECTIVE", r"#param\b"),
+     ("SPEC_CONST_DIRECTIVE", r"#spec_const\b"),
+     ("PRAGMA_DIRECTIVE", r"#pragma\b"),
++    ("CONSTANT_DIRECTIVE", r"#constant\b"),
+     ("COOP_GROUP_DIRECTIVE", r"#coop_group\b"),
+     ("BUILTIN_DIRECTIVE", r"#![A-Za-z_][A-Za-z0-9_]*"),
+     ("COMMENT", r"#[^\n]*|//[^\n]*"),
+@@ -585,10 +587,14 @@ class Parser:
+             if not self.skip("COMMA"):
+                 break
+         self.expect("RBRACE")
+-        if len(regs) not in (2, 4, 8, 16, 32, 64, 128):
++        # Wide MMA accumulators: HGMMA/QGMMA.64xNxK hold N/2 (F32) or N/4
++        # (F16) registers for N = 8..256 in steps of 8, so any even count up
++        # to 128 occurs (e.g. 12 for 64x24x16.F32, 6 for 64x24x16.F16); the
++        # matcher checks the count against the variant's operand size.
++        if len(regs) % 2 or not 2 <= len(regs) <= 128:
+             raise SyntaxError(
+                 f"register group must list 2 (64-bit), 4 (128-bit), "
+-                f"8 (256-bit) or 16/32/64/128 (wide MMA accumulator) "
++                f"8 (256-bit) or an even 6..128 (wide MMA accumulator) "
+                 f"registers, got {len(regs)}")
+         all_rz = all(r == 255 for r in regs)
+         if not all_rz:
+@@ -836,14 +842,22 @@ class Parser:
+                 self.pop()
+                 continue
+             pname = self.expect("IDENT").text
+-            # optional <size> suffix
++            # optional <size> or <size:align> suffix
+             psize = 4
++            palign = None
+             if self.peek() and self.peek().type == "LT":
+                 self.pop()
+                 sz_t = self.expect("NUMBER", "HEX")
+                 psize = int(sz_t.text, 0)
++                if self.skip("COLON"):
++                    palign = int(self.expect("NUMBER", "HEX").text, 0)
++                    if palign <= 0 or palign & (palign - 1):
++                        raise SyntaxError(
++                            f"parameter {pname!r}: alignment {palign} is "
++                            "not a power of two")
+                 self.expect("GT")
+-            decl.params.append(ParamDecl(name=pname, size=psize))
++            decl.params.append(ParamDecl(name=pname, size=psize,
++                                         align=palign))
+         self.expect("RPAREN")
+ 
+         # allocate cmem offsets for params
+@@ -861,6 +875,9 @@ class Parser:
+             if t.type == "PRAGMA_DIRECTIVE":
+                 self._parse_pragma(decl)
+                 continue
++            if t.type == "CONSTANT_DIRECTIVE":
++                self._parse_constant(decl)
++                continue
+             if t.type == "COOP_GROUP_DIRECTIVE":
+                 decl.instructions.append(self._parse_coop_group())
+                 continue
+@@ -896,6 +913,42 @@ class Parser:
+                 else ",".join(v.text for v in vals))
+             self.expect("RPAREN")
+ 
++    def _parse_constant(self, decl: KernelDecl) -> None:
++        """#constant(bank, name, offset, size[, 0xBYTES]): a named object in
++        constant bank `bank` (only 3, `.nv.constant3`).  BYTES are the
++        initial contents in memory order (two hex digits per byte, possibly
++        fewer than `size`; the rest is zero)."""
++        line = self.pop().line  # #constant
++        self.expect("LPAREN")
++        bank = int(self.expect("NUMBER", "HEX").text, 0)
++        if bank != 3:
++            raise SyntaxError(f"line {line}: #constant supports bank 3 only")
++        self.expect("COMMA")
++        # Any C identifier (some lex as registers/predicates), possibly with
++        # dots (LLVM-renamed internals).
++        name_types = ("IDENT", "REG", "UREG", "PRED", "UPRED", "BAR", "SB")
++        name = self.expect(*name_types).text
++        while self.peek() and self.peek().type == "DOT":
++            name += self.pop().text + self.expect(*name_types, "NUMBER").text
++        self.expect("COMMA")
++        offset = int(self.expect("NUMBER", "HEX").text, 0)
++        self.expect("COMMA")
++        size = int(self.expect("NUMBER", "HEX").text, 0)
++        data = b""
++        if self.skip("COMMA"):
++            digits = self.expect("HEX").text[2:]
++            if len(digits) % 2:
++                raise SyntaxError(f"line {line}: #constant {name}: odd number "
++                                  "of hex digits")
++            data = bytes.fromhex(digits)
++        self.expect("RPAREN")
++        if len(data) > size:
++            raise SyntaxError(f"line {line}: #constant {name}: {len(data)} "
++                              f"initial bytes exceed size {size}")
++        if any(c.name == name for c in decl.constants):
++            raise SyntaxError(f"line {line}: #constant {name} declared twice")
++        decl.constants.append(ConstantDecl(bank, name, offset, size, data))
++
+     def _resolve_params(self, inst: ParsedInstruction, decl: KernelDecl) -> None:
+         """Replace PARAM_REF operands with CONST_BANK using actual cmem offsets."""
+         for op in inst.operands:

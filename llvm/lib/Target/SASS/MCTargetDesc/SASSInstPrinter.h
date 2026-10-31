@@ -42,9 +42,22 @@ public:
   void printBrTarget(const MCInst *MI, unsigned OpNo, raw_ostream &O);
   void printGlobalAddr(const MCInst *MI, unsigned OpNo, raw_ostream &O);
   void printSharedAddr(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+  /// Global address without the descriptor: `[{Ra,Ra+1}+off]` (ATOM*.CAS).
+  void printRawGlobalAddr(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+  /// Memory-model scope of a .STRONG access: 0 SM (CTA), 1 GPU, 2 SYS.
+  void printScope(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+  // HGMMA/QGMMA (SASSInstrWGMMA.td); operand 1 is the flags immediate.
+  void printGMMAFlags(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+  void printGMMAAcc(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+  void printGMMAFrag(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+  void printGMMAUP(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+  void printGMMAGsb(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+  /// Base register of a uniform descriptor tuple: gdesc[UR8].
+  void printGDesc(const MCInst *MI, unsigned OpNo, raw_ostream &O);
 
 private:
-  void printGroupReg(MCRegister Reg, raw_ostream &O);
+  /// {R4,R5,...}: the first \p Count 32-bit registers of \p Reg (all if 0).
+  void printGroupReg(MCRegister Reg, raw_ostream &O, unsigned Count = 0);
   void printOffset(int64_t Off, raw_ostream &O);
 };
 

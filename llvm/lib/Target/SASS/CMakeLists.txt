@@ -15,10 +15,20 @@ add_llvm_target(SASSCodeGen
   SASSAsmPrinter.cpp
   SASSAsyncCopy.cpp
   SASSControlCodes.cpp
+  SASSExpandInlinePTX.cpp
   SASSFrameLowering.cpp
+  SASSISelAtomics.cpp
   SASSISelDAGToDAG.cpp
   SASSISelLowering.cpp
+  SASSISelLoweringTypes.cpp
+  SASSISelPTX.cpp
   SASSInstrInfo.cpp
+  SASSGlobals.cpp
+  SASSInlineCalls.cpp
+  SASSLowerInlinePTX.cpp
+  SASSLiftIdioms.cpp
+  SASSLowerMath.cpp
+  SASSLocalMemory.cpp
   SASSLowerKernelArgs.cpp
   SASSLowerMemcpy.cpp
   SASSPreRASched.cpp
@@ -27,6 +37,7 @@ add_llvm_target(SASSCodeGen
   SASSSubtarget.cpp
   SASSTargetMachine.cpp
   SASSUniformAddr.cpp
+  SASSWGMMA.cpp
 
   LINK_COMPONENTS
   Analysis

@@ -4,6 +4,7 @@
 #include "MCTargetDesc/SASSBaseInfo.h"
 #include "SASS.h"
 #include "SASSSubtarget.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -29,8 +30,14 @@ void SASSInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
   };
   if (SASS::GPR32RegClass.contains(Dst, Src))
     return Copy(SASS::MOVrr, Dst, Src, KillSrc);
-  if (SASS::GPR64RegClass.contains(Dst, Src))
-    return Copy(SASS::MOV64rr, Dst, Src, KillSrc);
+  if (SASS::GPR64RegClass.contains(Dst, Src)) {
+    // MOV.64 exists from Blackwell; Hopper copies the halves.
+    if (MBB.getParent()->getSubtarget<SASSSubtarget>().hasBlackwellISA())
+      return Copy(SASS::MOV64rr, Dst, Src, KillSrc);
+    for (unsigned Idx : {SASS::sub0, SASS::sub1})
+      Copy(SASS::MOVrr, RI.getSubReg(Dst, Idx), RI.getSubReg(Src, Idx), KillSrc);
+    return;
+  }
   if (SASS::GPR128RegClass.contains(Dst, Src)) {
     for (unsigned Idx : {SASS::sub0, SASS::sub1, SASS::sub2, SASS::sub3})
       Copy(SASS::MOVrr, RI.getSubReg(Dst, Idx), RI.getSubReg(Src, Idx),
@@ -48,6 +55,33 @@ void SASSInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
                 .addReg(Src, getKillRegState(KillSrc))
                 .addImm(0));
     return;
+  }
+  // wgmma accumulator tuples (GACC<n>) and descriptor quads: lane by lane,
+  // in the order that does not clobber overlapping sources.
+  if ((SASS::isGPRTupleClass(RI.getMinimalPhysRegClass(Dst)) &&
+       SASS::isGPRTupleClass(RI.getMinimalPhysRegClass(Src))) ||
+      SASS::UGPR128RegClass.contains(Dst, Src)) {
+    SmallVector<MCRegister, 64> D, S;
+    for (MCRegister R : RI.subregs(Dst))
+      if (RI.subregs(R).empty())
+        D.push_back(R);
+    for (MCRegister R : RI.subregs(Src))
+      if (RI.subregs(R).empty())
+        S.push_back(R);
+    if (D.size() == S.size() && !D.empty()) {
+      bool Uniform = SASS::UGPR128RegClass.contains(Dst);
+      auto ByEnc = [&](MCRegister A, MCRegister B) {
+        return RI.getEncodingValue(A) < RI.getEncodingValue(B);
+      };
+      llvm::sort(D, ByEnc);
+      llvm::sort(S, ByEnc);
+      bool Down = RI.getEncodingValue(D[0]) > RI.getEncodingValue(S[0]);
+      for (unsigned K = 0, E = D.size(); K != E; ++K) {
+        unsigned I = Down ? E - 1 - K : K;
+        Copy(Uniform ? SASS::UMOV : SASS::MOVrr, D[I], S[I], KillSrc);
+      }
+      return;
+    }
   }
   report_fatal_error("SASS: unsupported register copy");
 }
@@ -89,6 +123,86 @@ void SASSInstrInfo::expandAdd64(MachineInstr &MI) const {
   if (B.isReg())
     MRI.clearKillFlags(B.getReg());
   MI.eraseFromParent();
+}
+
+/// Spill (STL) or reload (LDL) opcode for a register class. Predicates and
+/// uniform registers use pseudos that SASSRegisterInfo::eliminateFrameIndex
+/// expands through a scavenged GPR.
+static unsigned spillOpcode(const TargetRegisterClass *RC, bool Store) {
+  if (SASS::GPR32RegClass.hasSubClassEq(RC))
+    return Store ? SASS::STL32 : SASS::LDL32;
+  if (SASS::GPR64RegClass.hasSubClassEq(RC))
+    return Store ? SASS::STL64 : SASS::LDL64;
+  if (SASS::GPR128RegClass.hasSubClassEq(RC))
+    return Store ? SASS::STL128 : SASS::LDL128;
+  if (SASS::PREDRegClass.hasSubClassEq(RC))
+    return Store ? SASS::SPILL_P : SASS::RELOAD_P;
+  if (SASS::UGPR32RegClass.hasSubClassEq(RC))
+    return Store ? SASS::SPILL_UR32 : SASS::RELOAD_UR32;
+  if (SASS::UGPR64RegClass.hasSubClassEq(RC))
+    return Store ? SASS::SPILL_UR64 : SASS::RELOAD_UR64;
+  report_fatal_error("SASS: cannot spill this register class");
+}
+
+static MachineMemOperand *spillMemOperand(MachineBasicBlock &MBB, int FI,
+                                          MachineMemOperand::Flags F) {
+  MachineFunction &MF = *MBB.getParent();
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  return MF.getMachineMemOperand(MachinePointerInfo::getFixedStack(MF, FI), F,
+                                 MFI.getObjectSize(FI), MFI.getObjectAlign(FI));
+}
+
+void SASSInstrInfo::storeRegToStackSlot(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register SrcReg,
+    bool IsKill, int FI, const TargetRegisterClass *RC, Register,
+    MachineInstr::MIFlag Flags) const {
+  noGuard(BuildMI(MBB, MI, DebugLoc(), get(spillOpcode(RC, true)))
+              .addFrameIndex(FI)
+              .addImm(0)
+              .addReg(SrcReg, getKillRegState(IsKill)))
+      .addMemOperand(spillMemOperand(MBB, FI, MachineMemOperand::MOStore))
+      .setMIFlags(Flags);
+}
+
+void SASSInstrInfo::loadRegFromStackSlot(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register DestReg,
+    int FI, const TargetRegisterClass *RC, Register, unsigned,
+    MachineInstr::MIFlag Flags) const {
+  noGuard(BuildMI(MBB, MI, DebugLoc(), get(spillOpcode(RC, false)), DestReg)
+              .addFrameIndex(FI)
+              .addImm(0))
+      .addMemOperand(spillMemOperand(MBB, FI, MachineMemOperand::MOLoad))
+      .setMIFlags(Flags);
+}
+
+/// The register an LDL/STL (or spill pseudo) at [FI+0] loads or stores.
+static Register stackSlotAccess(const MachineInstr &MI, bool Store,
+                                int &FrameIndex) {
+  unsigned Opc = MI.getOpcode();
+  bool Match =
+      Store ? is_contained({SASS::STL32, SASS::STL64, SASS::STL128,
+                            SASS::SPILL_P, SASS::SPILL_UR32, SASS::SPILL_UR64},
+                           Opc)
+            : is_contained({SASS::LDL32, SASS::LDL64, SASS::LDL128,
+                            SASS::RELOAD_P, SASS::RELOAD_UR32,
+                            SASS::RELOAD_UR64},
+                           Opc);
+  unsigned Addr = Store ? 0 : 1;
+  if (!Match || !MI.getOperand(Addr).isFI() ||
+      MI.getOperand(Addr + 1).getImm() != 0)
+    return Register();
+  FrameIndex = MI.getOperand(Addr).getIndex();
+  return MI.getOperand(Store ? 2 : 0).getReg();
+}
+
+Register SASSInstrInfo::isLoadFromStackSlot(const MachineInstr &MI,
+                                            int &FrameIndex) const {
+  return stackSlotAccess(MI, false, FrameIndex);
+}
+
+Register SASSInstrInfo::isStoreToStackSlot(const MachineInstr &MI,
+                                           int &FrameIndex) const {
+  return stackSlotAccess(MI, true, FrameIndex);
 }
 
 static bool isUncondBranch(unsigned Opc) { return Opc == SASS::BRA; }
@@ -209,7 +323,8 @@ bool SASSInstrInfo::isPredicated(const MachineInstr &MI) const {
 }
 
 bool SASSInstrInfo::isPredicable(const MachineInstr &MI) const {
-  return MI.getDesc().isPredicable() && !isPredicated(MI);
+  return MI.getDesc().isPredicable() && !SASS::notPredicable(MI.getDesc()) &&
+         !isPredicated(MI);
 }
 
 bool SASSInstrInfo::PredicateInstruction(MachineInstr &MI,

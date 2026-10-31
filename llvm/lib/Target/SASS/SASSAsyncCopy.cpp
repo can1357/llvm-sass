@@ -18,6 +18,10 @@
 //   block, the group is committed (LDGDEPBAR) and waited for
 //   (DEPBAR.LE SB5, 0).
 //
+// A function that issues its own cp.async groups (inline PTX or NVVM
+// intrinsics) is left as written: mixing its groups with ours would change
+// what its wait_group counts. It only gets the prelude below.
+//
 //===----------------------------------------------------------------------===//
 
 #include "MCTargetDesc/SASSBaseInfo.h"
@@ -74,10 +78,32 @@ static unsigned addrSpace(const MachineInstr &MI) {
                                : ~0u;
 }
 
+static bool isAsyncCopy(unsigned Opc) {
+  return Opc == SASS::LDGSTS128 || Opc == SASS::LDGSTS_CA32 ||
+         Opc == SASS::LDGSTS_CA64 || Opc == SASS::LDGSTS_CA128;
+}
+
+/// ptxas issues three predicated-off LDS ahead of the first LDGSTS of each
+/// commit group; this does the same for the copies \p MBB already has.
+static void addPreludes(MachineBasicBlock &MBB, const TargetInstrInfo &TII) {
+  bool Open = false;
+  for (MachineInstr &MI : MBB) {
+    if (MI.getOpcode() == SASS::LDGDEPBAR) {
+      Open = false;
+    } else if (isAsyncCopy(MI.getOpcode()) && !Open) {
+      for (int K = 0; K < 3; ++K)
+        BuildMI(MBB, MI, MI.getDebugLoc(), TII.get(SASS::LDGSTS_PRELUDE))
+            .addReg(SASS::PT)
+            .addImm(0);
+      Open = true;
+    }
+  }
+}
+
 /// Pending async copies must complete before \p MI: it may read their shared
 /// destination or write their global source, or it orders memory.
 static bool endsGroup(const MachineInstr &MI) {
-  if (MI.getOpcode() == SASS::LDGSTS128)
+  if (isAsyncCopy(MI.getOpcode()))
     return false;
   if (MI.isTerminator() || MI.isCall() || MI.hasUnmodeledSideEffects() ||
       MI.hasOrderedMemoryRef() || MI.mayStore())
@@ -198,8 +224,7 @@ bool SASSAsyncCopy::convertBlock(MachineBasicBlock &MBB) {
   if (!Changed)
     return false;
 
-  // Group boundaries: ptxas's prelude before a group, commit and wait
-  // before whatever must observe it.
+  // Commit and wait before whatever must observe the copies.
   bool Open = false;
   for (auto I = MBB.getFirstNonPHI();; ++I) {
     if (I == MBB.end() || endsGroup(*I)) {
@@ -218,14 +243,9 @@ bool SASSAsyncCopy::convertBlock(MachineBasicBlock &MBB) {
         break;
       continue;
     }
-    if (I->getOpcode() == SASS::LDGSTS128 && !Open) {
-      for (int K = 0; K < 3; ++K)
-        BuildMI(MBB, I, I->getDebugLoc(), TII->get(SASS::LDGSTS_PRELUDE))
-            .addReg(SASS::PT)
-            .addImm(0);
-      Open = true;
-    }
+    Open |= isAsyncCopy(I->getOpcode());
   }
+  addPreludes(MBB, *TII);
   return true;
 }
 
@@ -235,6 +255,16 @@ bool SASSAsyncCopy::runOnMachineFunction(MachineFunction &MF) {
   ST = &MF.getSubtarget<SASSSubtarget>();
   TII = ST->getInstrInfo();
   MRI = &MF.getRegInfo();
+  bool Explicit = any_of(MF, [](const MachineBasicBlock &MBB) {
+    return any_of(MBB, [](const MachineInstr &MI) {
+      return isAsyncCopy(MI.getOpcode()) || MI.getOpcode() == SASS::LDGDEPBAR;
+    });
+  });
+  if (Explicit) {
+    for (MachineBasicBlock &MBB : MF)
+      addPreludes(MBB, *TII);
+    return true;
+  }
   bool Changed = false;
   for (MachineBasicBlock &MBB : MF)
     Changed |= convertBlock(MBB);

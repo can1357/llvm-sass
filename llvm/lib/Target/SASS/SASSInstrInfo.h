@@ -29,6 +29,22 @@ public:
   /// Hopper, which lacks IADD.64. Needs virtual registers; erases \p MI.
   void expandAdd64(MachineInstr &MI) const;
 
+  /// Spills go to local memory (STL/LDL [FI]; SASSRegisterInfo).
+  void storeRegToStackSlot(MachineBasicBlock &MBB,
+                           MachineBasicBlock::iterator MI, Register SrcReg,
+                           bool isKill, int FrameIndex,
+                           const TargetRegisterClass *RC, Register VReg,
+                           MachineInstr::MIFlag Flags) const override;
+  void loadRegFromStackSlot(MachineBasicBlock &MBB,
+                            MachineBasicBlock::iterator MI, Register DestReg,
+                            int FrameIndex, const TargetRegisterClass *RC,
+                            Register VReg, unsigned SubReg,
+                            MachineInstr::MIFlag Flags) const override;
+
+  Register isLoadFromStackSlot(const MachineInstr &MI,
+                               int &FrameIndex) const override;
+  Register isStoreToStackSlot(const MachineInstr &MI,
+                              int &FrameIndex) const override;
   void copyPhysReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
                    const DebugLoc &DL, Register DestReg, Register SrcReg,
                    bool KillSrc, bool RenamableDest = false,

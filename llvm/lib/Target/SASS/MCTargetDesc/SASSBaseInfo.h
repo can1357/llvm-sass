@@ -26,6 +26,13 @@ inline bool writesSB(const MCInstrDesc &D) { return (D.TSFlags >> 6) & 1; }
 inline bool readsLate(const MCInstrDesc &D) { return (D.TSFlags >> 7) & 1; }
 /// Minimum stall cycles after issue (ISA MIN_WAIT_NEEDED; 5 for BRA/EXIT).
 inline unsigned minStall(const MCInstrDesc &D) { return (D.TSFlags >> 8) & 0xf; }
+/// FP32 arithmetic or compare that flushes denormals with .FTZ; the
+/// AsmPrinter marks it with InstFlagFTZ in flush-to-zero functions.
+inline bool takesFTZ(const MCInstrDesc &D) { return (D.TSFlags >> 12) & 1; }
+/// Never guarded by if-conversion (NoGuard in SASSInstrInfo.td).
+inline bool notPredicable(const MCInstrDesc &D) { return (D.TSFlags >> 13) & 1; }
+/// MCInst flag: print the .FTZ modifier (SASSInstPrinter::printInst).
+constexpr unsigned InstFlagFTZ = 1;
 
 /// ISETP condition: [2:0] LT LE GT GE EQ NE, bit 3 unsigned.
 inline const char *intCondStr(unsigned CC) {

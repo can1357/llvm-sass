@@ -151,7 +151,29 @@ def chain(name: str):
     return make
 
 
-KERNELS: dict[str, Callable] = {"saxpy": saxpy, "attn_fwd": attn_fwd, **{k: chain(k) for k in CHAINS}}
+def hgemm(cu: Driver, opts) -> Case:
+    """kernels/hgemm.cu: C = A B, A [M][K] and B [K][N] row-major f16, C f32."""
+    m = n = k = opts.gemm_size
+    rng = np.random.default_rng(0)
+    a = rng.uniform(-1, 1, (m, k)).astype(np.float16)
+    b = rng.uniform(-1, 1, (k, n)).astype(np.float16)
+    pa, pb, pc = cu.upload(a), cu.upload(b), cu.alloc(m * n * 4)
+    like = np.zeros((m, n), np.float32)
+    return Case(
+        [ptr(pa), ptr(pb), ptr(pc), scalar(np.int32, m), scalar(np.int32, n), scalar(np.int32, k)],
+        (n // 128, m // 128, 1),
+        (256, 1, 1),
+        reset=lambda: cu.fill(pc, 0, like.nbytes),
+        output=lambda: cu.read(pc, like),
+        want=a.astype(np.float64) @ b.astype(np.float64),
+        # Tensor-core f32 accumulation over K = 4096 products is off by ~1e-4
+        # (absolute) from float64 on outputs up to ~100; layout bugs are O(1).
+        rtol=1e-2,
+    )
+
+
+KERNELS: dict[str, Callable] = {"saxpy": saxpy, "attn_fwd": attn_fwd, "hgemm": hgemm,
+                                **{k: chain(k) for k in CHAINS}}
 
 
 def main() -> int:
@@ -163,6 +185,7 @@ def main() -> int:
     ap.add_argument("--warps-per-sm", type=int, default=4, help="chain occupancy (4 = one warp per SMSP)")
     ap.add_argument("--heads", type=int, default=8, help="attention heads")
     ap.add_argument("--seq", type=int, default=2048, help="attention sequence length (multiple of 64)")
+    ap.add_argument("--gemm-size", type=int, default=4096, help="hgemm M = N = K (multiple of 128)")
     ap.add_argument("--reps", type=int, default=15)
     ap.add_argument("--inner", type=int, default=5)
     ap.add_argument("--timeout", type=int, default=30, help="hard wall-clock limit, seconds")

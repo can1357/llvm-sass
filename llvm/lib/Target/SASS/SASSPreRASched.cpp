@@ -56,6 +56,10 @@ static cl::opt<unsigned> ExtraRegs(
              "pressure in the original order"));
 static cl::opt<bool> Disable("sass-disable-prera-sched", cl::init(false),
                              cl::desc("Keep the instruction selector's order"));
+static cl::opt<unsigned> RegSlack(
+    "sass-sched-reg-slack", cl::init(8),
+    cl::desc("Registers kept free below a launch-bounds register limit for "
+             "allocation fragmentation"));
 // The measured full-load interval is 8 cycles, but this kernel mix runs
 // fewer than four loading warps per SM most of the time: 4 measured best
 // on attention (2-5 within noise, 6+ slower).
@@ -162,7 +166,7 @@ static unsigned latency(const LatencyTables &L, const MachineInstr &P,
   if (SASS::writesSB(D)) {
     switch (M) {
     case LAT_LDG: case LAT_LD: return 400;
-    case LAT_LDS: case LAT_SHFL: return 30;
+    case LAT_LDS: case LAT_LDSM: case LAT_SHFL: return 30;
     case LAT_LDC: case LAT_LDCU: return 15;
     case LAT_S2R: case LAT_S2UR: return 25;
     default: return 20; // MUFU, F2I, ...
@@ -226,9 +230,7 @@ unsigned SASSPreRASched::width(Register R) const {
   if (!R.isVirtual())
     return 0;
   const TargetRegisterClass *RC = MRI->getRegClass(R);
-  if (!SASS::GPR32RegClass.hasSubClassEq(RC) &&
-      !SASS::GPR64RegClass.hasSubClassEq(RC) &&
-      !SASS::GPR128RegClass.hasSubClassEq(RC))
+  if (!SASS::isGPRTupleClass(RC))
     return 0;
   return TRI->getRegSizeInBits(*RC) / 32;
 }
@@ -330,6 +332,7 @@ Region SASSPreRASched::buildRegion(MachineBasicBlock &MBB) const {
 
   // Dependences, in original (topological) order.
   int LastOrder = -1;
+  int LastSync = -1; // WARPGROUP.ARRIVE/DEPBAR: nothing moves across them.
   SmallVector<unsigned, 32> MemSinceOrder;
   for (unsigned I = 0; I < N; ++I) {
     MachineInstr &MI = *Nodes[I].MI;
@@ -341,6 +344,14 @@ Region SASSPreRASched::buildRegion(MachineBasicBlock &MBB) const {
       auto It = Def ? Idx.find(Def) : Idx.end();
       if (It != Idx.end() && Preds.insert(It->second).second)
         AddEdge(It->second, I, latency(*Lat, *Def, MI));
+    }
+    if (SASS::isWarpgroupSync(MI)) {
+      for (int J = LastSync + 1; J < (int)I; ++J)
+        if (Preds.insert(J).second)
+          AddEdge(J, I, 0);
+      LastSync = I;
+    } else if (LastSync >= 0 && Preds.insert(LastSync).second) {
+      AddEdge(LastSync, I, 0);
     }
     bool Order = isOrderingPoint(MI);
     if (!Order && !MI.mayLoadOrStore())
@@ -519,9 +530,17 @@ bool SASSPreRASched::runOnMachineFunction(MachineFunction &MF) {
     Regions.push_back(buildRegion(MBB));
     FuncPeak = std::max(FuncPeak, Regions.back().Peak);
   }
+  // Under a register limit (__launch_bounds__ minimum blocks) the schedule
+  // stays below it, reordering to free registers where the original order
+  // exceeds it. The limit counts 3 registers the model does not
+  // (SASSAsmPrinter::regCount) and tuple alignment can waste a few more.
+  int Limit = FuncPeak + int(ExtraRegs);
+  unsigned MaxRegs = SASS::maxRegCount(MF.getFunction());
+  if (MaxRegs < 255)
+    Limit = std::min(Limit, int(MaxRegs) - 3 - int(RegSlack));
   bool Changed = false;
   for (Region &Rg : Regions)
     if (Rg.Nodes.size() > 2)
-      Changed |= schedule(Rg, FuncPeak + int(ExtraRegs));
+      Changed |= schedule(Rg, Limit);
   return Changed;
 }

@@ -14,12 +14,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "MCTargetDesc/SASSBaseInfo.h"
 #include "MCTargetDesc/SASSInstPrinter.h"
 #include "SASS.h"
 #include "SASSMachineFunctionInfo.h"
 #include "SASSSubtarget.h"
 #include "TargetInfo/SASSTargetInfo.h"
 #include "llvm/CodeGen/AsmPrinter.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCContext.h"
@@ -68,6 +70,9 @@ INITIALIZE_PASS(SASSAsmPrinter, "sass-asm-printer", "SASS Assembly Printer",
 /// REGCOUNT as ptxas reports it: highest GPR + 1, plus the two registers the
 /// hardware reserves at the top of the allocation.
 unsigned SASSAsmPrinter::regCount() const {
+  // setmaxnreg: the CTA pool starts from the __launch_bounds__ allocation.
+  if (unsigned Entry = SASS::setMaxRegEntryCount(*MF))
+    return Entry;
   const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
   int Max = 1; // R1 is the reserved stack pointer.
   for (const MachineBasicBlock &B : *MF)
@@ -88,11 +93,21 @@ void SASSAsmPrinter::emitFunctionEntryLabel() {
   std::string S;
   raw_string_ostream OS(S);
   OS << "#fn " << CurrentFnSym->getName() << '(';
-  for (auto [I, Size] : enumerate(FI->ParamSizes))
-    OS << (I ? ", " : "") << 'p' << I << '<' << Size << '>';
+  for (auto [I, Size] : enumerate(FI->ParamSizes)) {
+    OS << (I ? ", " : "") << 'p' << I << '<' << Size;
+    if (unsigned A = FI->ParamAligns[I])
+      OS << ':' << A;
+    OS << '>';
+  }
   OS << ") {\n    #pragma MAXREG_COUNT(" << regCount() << ')';
-  if (uint64_t Shared = SASS::sharedBytes(*MF->getFunction().getParent()))
+  // Per-thread local memory below R1 (SASSFrameLowering).
+  if (uint64_t Stack = MF->getFrameInfo().getStackSize())
+    OS << "\n    #pragma STACK_SIZE(" << Stack << ')';
+  const Module &M = *MF->getFunction().getParent();
+  uint64_t Shared = SASS::sharedBytes(M);
+  if (Shared || SASS::hasDynamicShared(M))
     OS << "\n    #pragma SHARED(" << Shared << ')';
+  SASS::printConstantObjects(MF->getFunction(), OS);
   OutStreamer->emitRawText(OS.str());
   Printer.reset(static_cast<SASSInstPrinter *>(TM.getTarget().createMCInstPrinter(
       TM.getTargetTriple(), 0, TM.getMCAsmInfo(), *TM.getMCInstrInfo(),
@@ -100,11 +115,16 @@ void SASSAsmPrinter::emitFunctionEntryLabel() {
 }
 
 // Shared variables are allocated through the `#pragma SHARED` window and
-// addressed by SASS::sharedOffset; there is no data section to emit.
+// addressed by SASS::sharedOffset; __constant__ data is declared in each
+// kernel block that uses it (SASS::printConstantObjects).
 void SASSAsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
-  if (GV->getAddressSpace() != 3)
-    report_fatal_error("SASS: global variable '" + GV->getName() +
-                       "' is not supported (only __shared__)");
+  unsigned AS = GV->getAddressSpace();
+  if (AS == 3 || AS == 4 || GV->getName().starts_with("llvm."))
+    return;
+  report_fatal_error(Twine("SASS: ") +
+                     (AS == 1 ? "__device__ variable '" : "global variable '") +
+                     GV->getName() +
+                     "' is not supported (only __shared__ and __constant__)");
 }
 
 void SASSAsmPrinter::emitFunctionBodyEnd() {
@@ -164,6 +184,10 @@ void SASSAsmPrinter::emitInstruction(const MachineInstr *MI) {
   raw_string_ostream OS(S);
   OS << "    ";
   MCInst Inst = lower(*MI);
+  if (SASS::takesFTZ(MI->getDesc()) &&
+      MF->getDenormalMode(APFloat::IEEEsingle()).Output ==
+          DenormalMode::PreserveSign)
+    Inst.setFlags(SASS::InstFlagFTZ);
   Printer->printInst(&Inst, 0, "", getSubtargetInfo(), OS);
   OS << ";[" << C.Wr << ':' << C.Rd << ":{";
   bool First = true;

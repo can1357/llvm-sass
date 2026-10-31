@@ -70,7 +70,7 @@ def SASSmadwu : SDNode<"SASSISD::MAD_WIDE_U", SDT_MadWide>;
 
 // TSFlags: [5:0] latency mnemonic (SASSLatency.td), [6] result tracked by a
 // write scoreboard, [7] sources read late (read scoreboard), [11:8] minimum
-// stall after issue.
+// stall after issue, [12] takes .FTZ in flush-to-zero functions.
 class SASSInst<dag od, dag id, string asm, list<dag> pattern = []>
     : Instruction {
   let Namespace = "SASS";
@@ -87,10 +87,18 @@ class SASSInst<dag od, dag id, string asm, list<dag> pattern = []>
   bit WriteSB = 0;
   bit ReadSB = 0;
   bits<4> MinStall = 1;
+  bit FTZ = 0;
   let TSFlags{5-0} = LatMnem;
   let TSFlags{6} = WriteSB;
   let TSFlags{7} = ReadSB;
   let TSFlags{11-8} = MinStall;
+  let TSFlags{12} = FTZ;
+  // Every instruction has a guard operand, which makes TableGen mark it
+  // predicable whatever `isPredicable` says; NoGuard keeps an instruction
+  // out of if-conversion (uniform-datapath instructions need a uniform
+  // guard).
+  bit NoGuard = 0;
+  let TSFlags{13} = NoGuard;
 }
 
 // Decoupled (scoreboarded) instructions: MIO/UDP pipes.
@@ -394,10 +402,13 @@ def : Pat<(select i1:$p, i64:$a, i64:$b),
 //===----------------------------------------------------------------------===//
 
 let LatMnem = LAT_FADD, SchedRW = [WriteFMA] in {
+let FTZ = 1 in {
 def FADDrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b), "FADD $d, $a, $b",
                       [(set f32:$d, (fadd f32:$a, f32:$b))]>;
 def FADDri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, fimm32:$b), "FADD $d, $a, $b",
                       [(set f32:$d, (fadd f32:$a, fpimm:$b))]>;
+}
+let FTZ = 1 in
 def FSUBrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b), "FADD $d, $a, -$b",
                       [(set f32:$d, (fsub f32:$a, f32:$b))]>;
 def FNEG : SASSInst<(outs GPR32:$d), (ins GPR32:$a), "FADD $d, -$a, -RZ",
@@ -405,13 +416,13 @@ def FNEG : SASSInst<(outs GPR32:$d), (ins GPR32:$a), "FADD $d, -$a, -RZ",
 def FABS : SASSInst<(outs GPR32:$d), (ins GPR32:$a), "FADD $d, |$a|, -RZ",
                     [(set f32:$d, (fabs f32:$a))]>;
 }
-let LatMnem = LAT_FMUL, SchedRW = [WriteFMA] in {
+let LatMnem = LAT_FMUL, SchedRW = [WriteFMA], FTZ = 1 in {
 def FMULrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b), "FMUL $d, $a, $b",
                       [(set f32:$d, (fmul f32:$a, f32:$b))]>;
 def FMULri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, fimm32:$b), "FMUL $d, $a, $b",
                       [(set f32:$d, (fmul f32:$a, fpimm:$b))]>;
 }
-let LatMnem = LAT_FFMA, SchedRW = [WriteFMA] in {
+let LatMnem = LAT_FFMA, SchedRW = [WriteFMA], FTZ = 1 in {
 def FFMArrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, GPR32:$c),
                        "FFMA $d, $a, $b, $c",
                        [(set f32:$d, (fma f32:$a, f32:$b, f32:$c))]>;
@@ -428,13 +439,13 @@ def FFMAnrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, GPR32:$c),
                        "FFMA $d, -$a, $b, $c",
                        [(set f32:$d, (fma (fneg f32:$a), f32:$b, f32:$c))]>;
 }
-let LatMnem = LAT_FMNMX in {
+let LatMnem = LAT_FMNMX, FTZ = 1 in {
 def FMINrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b), "FMNMX $d, $a, $b, PT",
                       [(set f32:$d, (fminnum f32:$a, f32:$b))]>;
 def FMAXrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b), "FMNMX $d, $a, $b, !PT",
                       [(set f32:$d, (fmaxnum f32:$a, f32:$b))]>;
 }
-let LatMnem = LAT_FSETP, SchedRW = [WritePred] in {
+let LatMnem = LAT_FSETP, SchedRW = [WritePred], FTZ = 1 in {
 def FSETPrr : SASSInst<(outs PRED:$p),
                        (ins GPR32:$a, GPR32:$b, fcc:$cc, PRED:$c, negflag:$cn),
                        "FSETP.${cc}.AND $p, PT, $a, $b, ${cn}$c">;
@@ -464,32 +475,15 @@ def F2IU32 : SASSVarInst<(outs GPR32:$d), (ins GPR32:$a), "F2I.U32.TRUNC.NTZ $d,
                          [(set i32:$d, (fp_to_uint f32:$a))]>;
 }
 
-// Approximate math, only where the IR allows it.
-def arcp_fdiv : PatFrag<(ops node:$a, node:$b), (fdiv node:$a, node:$b), [{
-  return N->getFlags().hasAllowReciprocal();
-}]>;
-def afn_fsqrt : PatFrag<(ops node:$a), (fsqrt node:$a), [{
-  return N->getFlags().hasApproximateFuncs();
-}]>;
-def afn_fexp2 : PatFrag<(ops node:$a), (fexp2 node:$a), [{
-  return N->getFlags().hasApproximateFuncs();
-}]>;
-def afn_flog2 : PatFrag<(ops node:$a), (flog2 node:$a), [{
-  return N->getFlags().hasApproximateFuncs();
-}]>;
-let LatMnem = LAT_MUFU, SchedRW = [WriteSFU] in {
-def MUFU_RCP : SASSVarInst<(outs GPR32:$d), (ins GPR32:$a), "MUFU.RCP $d, $a">;
-def MUFU_SQRT : SASSVarInst<(outs GPR32:$d), (ins GPR32:$a), "MUFU.SQRT $d, $a",
-                            [(set f32:$d, (afn_fsqrt f32:$a))]>;
-def MUFU_EX2 : SASSVarInst<(outs GPR32:$d), (ins GPR32:$a), "MUFU.EX2 $d, $a",
-                           [(set f32:$d, (afn_fexp2 f32:$a))]>;
-def MUFU_LG2 : SASSVarInst<(outs GPR32:$d), (ins GPR32:$a), "MUFU.LG2 $d, $a",
-                           [(set f32:$d, (afn_flog2 f32:$a))]>;
-}
-def : Pat<(arcp_fdiv f32:$a, f32:$b), (FMULrr $a, (MUFU_RCP $b))>;
+// Approximate math (MUFU) is in SASSInstrMath.td.
 
 def : Pat<(f32 (bitconvert i32:$a)), (COPY_TO_REGCLASS $a, GPR32)>;
 def : Pat<(i32 (bitconvert f32:$a)), (COPY_TO_REGCLASS $a, GPR32)>;
+// Packed f16x2/bf16x2 values live in a 32-bit register (tensor-core fragments).
+foreach VT = [v2f16, v2bf16] in {
+  def : Pat<(VT (bitconvert i32:$a)), (COPY_TO_REGCLASS $a, GPR32)>;
+  def : Pat<(i32 (bitconvert VT:$a)), (COPY_TO_REGCLASS $a, GPR32)>;
+}
 
 //===----------------------------------------------------------------------===//
 // Memory
@@ -605,6 +599,47 @@ let mayLoad = 1, mayStore = 1, LatMnem = LAT_STS, ReadSB = 1,
     SchedRW = [WriteST], Uses = [URD2], isPredicable = 0 in
 def LDGSTS128 : SASSInst<(outs), (ins mems:$s, memg:$g),
                          "LDGSTS.E.BYPASS.128 $s, $g">;
+// Explicit cp.async.ca (cache in L1) of 4, 8 or 16 bytes; cp.async.cg is
+// LDGSTS128 above. Selected from llvm.nvvm.cp.async.* intrinsics.
+let mayLoad = 1, mayStore = 1, LatMnem = LAT_STS, ReadSB = 1,
+    SchedRW = [WriteST], Uses = [URD2], isPredicable = 0 in {
+def LDGSTS_CA32 : SASSInst<(outs), (ins mems:$s, memg:$g), "LDGSTS.E $s, $g">;
+def LDGSTS_CA64 : SASSInst<(outs), (ins mems:$s, memg:$g), "LDGSTS.E.64 $s, $g">;
+def LDGSTS_CA128 : SASSInst<(outs), (ins mems:$s, memg:$g), "LDGSTS.E.128 $s, $g">;
+}
+
+//===----------------------------------------------------------------------===//
+// Warp-level matrix instructions (sm_80+), selected in C++ from the
+// llvm.nvvm.ldmatrix/stmatrix/mma intrinsics (SASSDAGToDAGISel).
+//===----------------------------------------------------------------------===//
+
+// LDSM/STSM move 1, 2 or 4 8x8 b16 matrices between shared memory and one
+// 32-bit register per matrix per thread; MT88 transposes each matrix.
+multiclass MatrixMoves<string sfx, RegisterOperand RC> {
+  let mayLoad = 1, LatMnem = LAT_LDSM, SchedRW = [WriteLDS] in {
+    def _LD : SASSVarInst<(outs RC:$d), (ins mems:$addr), "LDSM.16.M88"#sfx#" $d, $addr">;
+    def _LDT : SASSVarInst<(outs RC:$d), (ins mems:$addr), "LDSM.16.MT88"#sfx#" $d, $addr">;
+  }
+  let mayStore = 1, LatMnem = LAT_STSM, SchedRW = [WriteST] in {
+    def _ST : SASSVarInst<(outs), (ins mems:$addr, RC:$v), "STSM.16.M88"#sfx#" $addr, $v">;
+    def _STT : SASSVarInst<(outs), (ins mems:$addr, RC:$v), "STSM.16.MT88"#sfx#" $addr, $v">;
+  }
+}
+defm MAT1 : MatrixMoves<"", Op32>;
+defm MAT2 : MatrixMoves<".2", G64>;
+defm MAT4 : MatrixMoves<".4", G128>;
+
+// mma.sync.m16n8k16 with f32 accumulators: D, A and C are 4 registers, B is
+// 2. HMMA has a fixed latency (no scoreboard) and reads its sources over
+// several cycles, so writers of its sources wait (AntiGPR in
+// SASSControlCodes).
+let LatMnem = LAT_HMMA, SchedRW = [WriteWide] in {
+def HMMA16816F32 : SASSInst<(outs G128:$d), (ins G128:$a, G64:$b, G128:$c),
+                            "HMMA.16816.F32 $d, $a, $b, $c">;
+def HMMA16816F32BF16 : SASSInst<(outs G128:$d), (ins G128:$a, G64:$b, G128:$c),
+                                "HMMA.16816.F32.BF16 $d, $a, $b, $c">;
+}
+
 let hasSideEffects = 1, isPredicable = 0, LatMnem = LAT_NOP in {
 // ptxas issues three predicated-off LDS ahead of each group of LDGSTS.
 def LDGSTS_PRELUDE : SASSInst<(outs), (ins), "@!PT LDS RZ, [RZ]">;
@@ -703,10 +738,6 @@ def : Pat<(i32 (int_nvvm_shfl_sync_bfly_i32 (i32 -1), i32:$a, i32:$l, (i32 31)))
 def : Pat<(f32 (int_nvvm_shfl_sync_bfly_f32 (i32 -1), f32:$a, i32:$l, (i32 31))),
           (SHFLBFLYrr $a, $l)>;
 
-// PTX approximate math maps 1:1 onto MUFU in its flush-to-zero form.
-def : Pat<(f32 (int_nvvm_ex2_approx_ftz f32:$a)), (MUFU_EX2 $a)>;
-def : Pat<(f32 (int_nvvm_rcp_approx_ftz_f f32:$a)), (MUFU_RCP $a)>;
-
 //===----------------------------------------------------------------------===//
 // Constant bank and special registers
 //===----------------------------------------------------------------------===//
@@ -795,3 +826,11 @@ def MOVru : SASSInst<(outs GPR32:$d), (ins UGPR32:$a), "MOV $d, $a">;
 
 let LatMnem = LAT_NOP in
 def NOP : SASSInst<(outs), (ins), "NOP">;
+
+include "SASSInstrTypes.td"
+include "SASSInstrMath.td"
+include "SASSInstrBits.td"
+include "SASSInstrLocal.td"
+include "SASSInstrPTX.td"
+include "SASSInstrGlobals.td"
+include "SASSInstrWGMMA.td"

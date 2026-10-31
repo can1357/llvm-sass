@@ -26,6 +26,9 @@ class Driver:
         "cuCtxSynchronize": [],
         "cuModuleLoadData": [ctypes.POINTER(P), ctypes.c_char_p],
         "cuModuleGetFunction": [ctypes.POINTER(P), P, ctypes.c_char_p],
+        "cuModuleGetGlobal_v2": [ctypes.POINTER(U64), ctypes.POINTER(ctypes.c_size_t), P,
+                                 ctypes.c_char_p],
+        "cuFuncSetAttribute": [P, ctypes.c_int, ctypes.c_int],
         "cuMemAlloc_v2": [ctypes.POINTER(U64), ctypes.c_size_t],
         "cuMemFree_v2": [U64],
         "cuMemcpyHtoD_v2": [U64, ctypes.c_char_p, ctypes.c_size_t],
@@ -86,6 +89,17 @@ class Driver:
     def load(self, cubin: bytes, kernel: str) -> P:
         return self.function(self.module(cubin), kernel)
 
+    def global_(self, mod: P, name: str) -> tuple[int, int]:
+        """Device address and size of a module variable (e.g. __constant__)."""
+        ptr, size = U64(), ctypes.c_size_t()
+        self.call("cuModuleGetGlobal_v2", ctypes.byref(ptr), ctypes.byref(size), mod,
+                  name.encode())
+        return ptr.value, size.value
+
+    def max_dynamic_shared(self, fn: P, nbytes: int) -> None:
+        """Allow `nbytes` of dynamic shared memory (needed above 48 KB)."""
+        self.call("cuFuncSetAttribute", fn, 8, nbytes)  # MAX_DYNAMIC_SHARED_SIZE_BYTES
+
     def alloc(self, nbytes: int) -> int:
         ptr = U64()
         self.call("cuMemAlloc_v2", ctypes.byref(ptr), max(nbytes, 1))
@@ -110,10 +124,12 @@ class Driver:
         self.call("cuMemcpyDtoH_v2", buf, ptr, like.nbytes)
         return np.frombuffer(buf.raw, dtype=like.dtype).reshape(like.shape).copy()
 
-    def launch(self, fn: P, grid, block, params: list[bytes]) -> None:
+    def launch(self, fn: P, grid, block, params: list[bytes], shared: int = 0) -> None:
+        """`params[i]` holds parameter i's bytes (a struct packed by hand);
+        `shared` is the dynamic shared memory size in bytes."""
         bufs = [ctypes.create_string_buffer(p, len(p)) for p in params]
         argv = (P * len(bufs))(*(ctypes.cast(b, P) for b in bufs))
-        self.call("cuLaunchKernel", fn, *grid, *block, 0, None, argv, None)
+        self.call("cuLaunchKernel", fn, *grid, *block, shared, None, argv, None)
 
     def sync(self) -> None:
         self.call("cuCtxSynchronize")

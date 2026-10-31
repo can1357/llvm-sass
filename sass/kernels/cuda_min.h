@@ -8,6 +8,8 @@
 #define __constant__ __attribute__((constant))
 #define __forceinline__ __attribute__((always_inline)) inline
 #define __launch_bounds__(...) __attribute__((launch_bounds(__VA_ARGS__)))
+#define __grid_constant__ __attribute__((grid_constant))
+#define __align__(n) __attribute__((aligned(n)))
 #define SASS_CLANG 1
 typedef __SIZE_TYPE__ size_t;
 #define INFINITY __builtin_inff()
@@ -37,10 +39,26 @@ struct __attribute__((aligned(16))) float4 {
 SASS_INL float4 make_float4(float x, float y, float z, float w) {
   return {x, y, z, w};
 }
-SASS_INL float __shfl_xor_sync(unsigned mask, float v, int lane) {
-  return __nvvm_shfl_sync_bfly_f32(mask, v, lane, 0x1f);
+struct __attribute__((aligned(16))) uint4 {
+  unsigned x, y, z, w;
+};
+struct __attribute__((aligned(8))) uint2 {
+  unsigned x, y;
+};
+SASS_INL uint4 make_uint4(unsigned x, unsigned y, unsigned z, unsigned w) {
+  return {x, y, z, w};
+}
+SASS_INL unsigned __float_as_uint(float x) {
+  return __builtin_bit_cast(unsigned, x);
+}
+// Shared-window address of a generic pointer to shared memory, as taken by
+// ldmatrix/stmatrix/cp.async operands.
+SASS_INL size_t __cvta_generic_to_shared(const void *p) {
+  return (size_t)(const __attribute__((address_space(3))) void *)p;
 }
 // ex2.approx.ftz.f32 / rcp.approx.ftz.f32 (kernels use the same PTX through
 // inline asm under nvcc).
 SASS_INL float ex2_approx(float x) { return __nvvm_ex2_approx_ftz_f(x); }
 SASS_INL float rcp_approx(float x) { return __nvvm_rcp_approx_ftz_f(x); }
+#include "cuda_math.h"
+#include "cuda_types.h"
