@@ -5,7 +5,8 @@
 // every instruction's control word:
 //
 // * Fixed latency: a consumer may issue only `lat(producer, consumer)` cycles
-//   after its producer (ptxas's own sm_120 tables, SASSLatencyTables.inc).
+//   after its producer (ptxas's own sm_90 or sm_120 tables,
+//   SASSLatencyTables.inc).
 //   Missing cycles are added to the previous instruction's stall (stall N =
 //   the next instruction issues N cycles later). Each block drains pending
 //   fixed results before control leaves it, so blocks start clean.
@@ -53,7 +54,6 @@ constexpr unsigned FirstWriteSB = 1, LastWriteSB = 5;
 constexpr int SBSetDelay = 2;
 constexpr int Never = -1000;
 
-/// Fixed-latency ALU/FMA mnemonics whose GPR edges are 4 cycles on silicon.
 /// 32-bit integer-pipe ALU ops.
 bool isIntPipe(unsigned Mnem) {
   return Mnem == LAT_LOP3 || Mnem == LAT_SHF || Mnem == LAT_IADD3 ||
@@ -62,13 +62,14 @@ bool isIntPipe(unsigned Mnem) {
 /// Integer ops on the FMA pipe (IMAD) or with its timing (two-input IADD).
 bool isIntFma(unsigned Mnem) { return Mnem == LAT_IMAD || Mnem == LAT_IADD; }
 
-unsigned tableLat(unsigned Prod, unsigned Cons, RegKind K) {
+unsigned tableLat(const LatencyTables &L, unsigned Prod, unsigned Cons,
+                  RegKind K) {
   unsigned V = 0;
   switch (K) {
-  case RegKind::GPR: V = TrueGPR[Prod][Cons]; break;
-  case RegKind::Pred: V = TruePred[Prod][Cons]; break;
-  case RegKind::PredGuard: V = TruePredGuard[Prod][Cons]; break;
-  case RegKind::UGPR: V = TrueUGPR[Prod][Cons]; break;
+  case RegKind::GPR: V = L.TrueGPR[Prod][Cons]; break;
+  case RegKind::Pred: V = L.TruePred[Prod][Cons]; break;
+  case RegKind::PredGuard: V = L.TruePredGuard[Prod][Cons]; break;
+  case RegKind::UGPR: V = L.TrueUGPR[Prod][Cons]; break;
   }
   // No table entry for a fixed-latency pair: assume the common int latency.
   return V ? V : 6;
@@ -76,14 +77,14 @@ unsigned tableLat(unsigned Prod, unsigned Cons, RegKind K) {
 
 /// Worst-case latency of a fixed result over every consumer, used when the
 /// consumer is in another block.
-unsigned drainLat(unsigned Prod, RegKind K) {
+unsigned drainLat(const LatencyTables &L, unsigned Prod, RegKind K) {
   unsigned V = 6;
   for (unsigned C = 0; C < NumLatMnem; ++C) {
     if (K == RegKind::Pred) {
-      V = std::max<unsigned>(V, TruePred[Prod][C]);
-      V = std::max<unsigned>(V, TruePredGuard[Prod][C]);
+      V = std::max<unsigned>(V, L.TruePred[Prod][C]);
+      V = std::max<unsigned>(V, L.TruePredGuard[Prod][C]);
     } else {
-      V = std::max(V, tableLat(Prod, C, K));
+      V = std::max(V, tableLat(L, Prod, C, K));
     }
   }
   return V;
@@ -133,8 +134,9 @@ struct FixedDef {
 /// nothing shorter than ptxas emits (a blanket 4, IMAD included, gave wrong
 /// fmix/xorshift results on GB10), and IMAD -> IMAD, 64-bit results and
 /// cross-block uses (drainLat) keep the table.
-unsigned useLat(const FixedDef &F, unsigned Cons, RegKind K) {
-  unsigned V = tableLat(F.Mnem, Cons, K);
+unsigned useLat(const LatencyTables &L, const FixedDef &F, unsigned Cons,
+                RegKind K) {
+  unsigned V = tableLat(L, F.Mnem, Cons, K);
   if (K != RegKind::GPR || F.Wide)
     return V;
   bool PI = isIntPipe(F.Mnem), CI = isIntPipe(Cons);
@@ -156,6 +158,8 @@ public:
 private:
   const TargetRegisterInfo *TRI = nullptr;
   const SASSInstrInfo *TII = nullptr;
+  /// Fixed latencies of the function's architecture.
+  const LatencyTables *Lat = nullptr;
   /// Highest write scoreboard for results: below SASS::AsyncCopySB when the
   /// function commits async copies to it.
   unsigned LastResultSB = LastWriteSB;
@@ -315,7 +319,7 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
           Req |= S.Rd[U]; // WAR against a late reader.
         const FixedDef &F = Fixed[U];
         if (F.Issue != Never)
-          Need = std::max<int>(Need, F.Issue + useLat(F, M, K));
+          Need = std::max<int>(Need, F.Issue + useLat(*Lat, F, M, K));
       }
     }
     for (unsigned SB = 0; SB < 6; ++SB)
@@ -392,7 +396,7 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
   int Ready = T;
   for (const FixedDef &F : Fixed)
     if (F.Issue != Never)
-      Ready = std::max<int>(Ready, F.Issue + drainLat(F.Mnem, F.K));
+      Ready = std::max<int>(Ready, F.Issue + drainLat(*Lat, F.Mnem, F.K));
   for (int Set : SBSet)
     Ready = std::max(Ready, Set + SBSetDelay);
   if (Ready > T && !Out.empty())
@@ -413,8 +417,10 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
 }
 
 bool SASSControlCodes::runOnMachineFunction(MachineFunction &MF) {
-  TRI = MF.getSubtarget().getRegisterInfo();
-  TII = static_cast<const SASSInstrInfo *>(MF.getSubtarget().getInstrInfo());
+  const auto &ST = MF.getSubtarget<SASSSubtarget>();
+  TRI = ST.getRegisterInfo();
+  TII = ST.getInstrInfo();
+  Lat = ST.hasBlackwellISA() ? &SM120Latencies : &SM90Latencies;
   unsigned NumUnits = TRI->getNumRegUnits();
   static_assert(SASS::AsyncCopySB == LastWriteSB);
   LastResultSB = LastWriteSB;

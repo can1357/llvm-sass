@@ -13,7 +13,8 @@ using namespace llvm;
 
 SASSSubtarget::SASSSubtarget(const Triple &TT, StringRef CPU, StringRef FS,
                              const TargetMachine &TM)
-    : SASSGenSubtargetInfo(TT, CPU, /*TuneCPU=*/CPU, FS), InstrInfo(*this),
+    : SASSGenSubtargetInfo(TT, CPU, /*TuneCPU=*/CPU, FS),
+      InstrInfo((ParseSubtargetFeatures(CPU, /*TuneCPU=*/CPU, FS), *this)),
       TLInfo(TM, *this),
       TSInfo(std::make_unique<SASSSelectionDAGInfo>()) {}
 

@@ -35,6 +35,7 @@
 #include "MCTargetDesc/SASSBaseInfo.h"
 #include "SASS.h"
 #include "SASSRegisterInfo.h"
+#include "SASSSubtarget.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -106,6 +107,8 @@ public:
 private:
   const TargetRegisterInfo *TRI = nullptr;
   const MachineRegisterInfo *MRI = nullptr;
+  /// Fixed latencies of the function's architecture.
+  const LatencyTables *Lat = nullptr;
   DenseMap<const MachineBasicBlock *, RegSet> LiveIn, LiveOut;
 
   Register root(Register R) const;
@@ -131,13 +134,27 @@ static bool isPseudo(const MachineInstr &MI) {
          MI.isInsertSubreg() || MI.isSubregToReg() || MI.isKill();
 }
 
+/// Low half of a Hopper 64-bit add, producing a carry predicate.
+static bool isCarryOut(const MachineInstr &MI) {
+  unsigned Opc = MI.getOpcode();
+  return Opc == SASS::IADD3COrr || Opc == SASS::IADD3COri ||
+         Opc == SASS::IADD3COrn;
+}
+/// High half of a Hopper 64-bit add, consuming a carry predicate.
+static bool isCarryIn(const MachineInstr &MI) {
+  unsigned Opc = MI.getOpcode();
+  return Opc == SASS::IADD3Xrr || Opc == SASS::IADD3Xri ||
+         Opc == SASS::IADD3Xrn;
+}
+
 /// Goes through the sub-core's LSU queue.
 static bool usesLSU(const MachineInstr &MI) {
   return MI.mayLoadOrStore() || SASS::latMnem(MI.getDesc()) == LAT_SHFL;
 }
 
-/// Issue-to-use cycles from \p P to \p C.
-static unsigned latency(const MachineInstr &P, const MachineInstr &C) {
+/// Issue-to-use cycles from \p P to \p C under latency tables \p L.
+static unsigned latency(const LatencyTables &L, const MachineInstr &P,
+                        const MachineInstr &C) {
   if (isPseudo(P))
     return 0;
   const MCInstrDesc &D = P.getDesc();
@@ -151,20 +168,23 @@ static unsigned latency(const MachineInstr &P, const MachineInstr &C) {
     default: return 20; // MUFU, F2I, ...
     }
   }
+  if (isPseudo(C))
+    return 0;
+  unsigned CM = SASS::latMnem(C.getDesc());
   bool Uniform = false;
   for (const MachineOperand &MO : P.defs()) {
     if (!MO.getReg().isVirtual())
       continue;
     const TargetRegisterClass *RC =
         P.getMF()->getRegInfo().getRegClass(MO.getReg());
-    if (RC == &SASS::PREDRegClass)
-      return 13; // Predicate to guard/branch.
+    if (RC == &SASS::PREDRegClass) {
+      // A Hopper 64-bit add's carry into its high half (SASSInstrInfo::
+      // expandAdd64); other predicate uses plan for a guard/branch.
+      return isCarryIn(C) && L.TruePred[M][CM] ? L.TruePred[M][CM] : 13;
+    }
     Uniform |= RC == &SASS::UGPR32RegClass;
   }
-  if (isPseudo(C))
-    return 0;
-  unsigned CM = SASS::latMnem(C.getDesc());
-  unsigned V = Uniform ? TrueUGPR[M][CM] : TrueGPR[M][CM];
+  unsigned V = Uniform ? L.TrueUGPR[M][CM] : L.TrueGPR[M][CM];
   return V ? V : 6;
 }
 
@@ -320,7 +340,7 @@ Region SASSPreRASched::buildRegion(MachineBasicBlock &MBB) const {
       MachineInstr *Def = MRI->getVRegDef(MO.getReg());
       auto It = Def ? Idx.find(Def) : Idx.end();
       if (It != Idx.end() && Preds.insert(It->second).second)
-        AddEdge(It->second, I, latency(*Def, MI));
+        AddEdge(It->second, I, latency(*Lat, *Def, MI));
     }
     bool Order = isOrderingPoint(MI);
     if (!Order && !MI.mayLoadOrStore())
@@ -355,7 +375,7 @@ Region SASSPreRASched::buildRegion(MachineBasicBlock &MBB) const {
       for (const MachineOperand &MO : T.uses())
         if (MO.isReg() && MO.getReg().isVirtual() &&
             MRI->getVRegDef(MO.getReg()) == Nd.MI)
-          H = std::max(H, latency(*Nd.MI, T));
+          H = std::max(H, latency(*Lat, *Nd.MI, T));
     Nd.Height = H;
   }
 
@@ -410,13 +430,18 @@ bool SASSPreRASched::schedule(Region &Rg, int Limit) const {
       R = std::max(R, Dispatch[QHead]);
     return R;
   };
+  // The pressure model counts GPRs only, and predicates cannot be spilled:
+  // a 64-bit add's carry-in half follows its carry-out half at once, so at
+  // most one carry is live (as in ptxas's code).
+  unsigned CarryNext = ~0u;
   while (!Avail.empty()) {
     // Fits the limit, else frees the most; then ready; then height; then
     // original order.
     using Key = std::tuple<bool, int, bool, unsigned, int>;
     unsigned BestPos = 0;
     Key Best;
-    for (unsigned K = 0; K < Avail.size(); ++K) {
+    auto Forced = find(Avail, CarryNext);
+    for (unsigned K = 0; K < Avail.size() && Forced == Avail.end(); ++K) {
       unsigned C = Avail[K];
       int D = delta(Rg, *Nodes[C].MI, Left, /*Commit=*/false);
       bool Fits = P + D <= Limit;
@@ -427,9 +452,16 @@ bool SASSPreRASched::schedule(Region &Rg, int Limit) const {
         BestPos = K;
       }
     }
+    if (Forced != Avail.end())
+      BestPos = Forced - Avail.begin();
     unsigned C = Avail[BestPos];
     Avail.erase(Avail.begin() + BestPos);
     Node &Nd = Nodes[C];
+    CarryNext = ~0u;
+    if (isCarryOut(*Nd.MI))
+      for (auto [S, Lat] : Nd.Succs)
+        if (isCarryIn(*Nodes[S].MI))
+          CarryNext = S;
     LLVM_DEBUG(dbgs() << "  @" << std::max(Cycle, ReadyAt(C)) << " h"
                       << Nd.Height << " e" << Nd.Earliest << " P" << P << " "
                       << *Nd.MI);
@@ -476,8 +508,10 @@ bool SASSPreRASched::schedule(Region &Rg, int Limit) const {
 bool SASSPreRASched::runOnMachineFunction(MachineFunction &MF) {
   if (Disable)
     return false;
-  TRI = MF.getSubtarget().getRegisterInfo();
+  const auto &ST = MF.getSubtarget<SASSSubtarget>();
+  TRI = ST.getRegisterInfo();
   MRI = &MF.getRegInfo();
+  Lat = ST.hasBlackwellISA() ? &SM120Latencies : &SM90Latencies;
   computeLiveness(MF);
   SmallVector<Region, 8> Regions;
   int FuncPeak = 0;

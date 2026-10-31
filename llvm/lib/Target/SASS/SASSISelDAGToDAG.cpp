@@ -2,6 +2,7 @@
 
 #include "SASS.h"
 #include "SASSSelectionDAGInfo.h"
+#include "SASSSubtarget.h"
 #include "SASSTargetMachine.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
@@ -19,6 +20,11 @@ class SASSDAGToDAGISel : public SelectionDAGISel {
 public:
   SASSDAGToDAGISel(SASSTargetMachine &TM, CodeGenOptLevel OL)
       : SelectionDAGISel(TM, OL) {}
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    Subtarget = &MF.getSubtarget<SASSSubtarget>();
+    return SelectionDAGISel::runOnMachineFunction(MF);
+  }
 
   void Select(SDNode *N) override;
 
@@ -38,6 +44,9 @@ public:
 #include "SASSGenDAGISel.inc"
 
 private:
+  /// Read by the generated pattern predicates (HasBlackwellISA, ...).
+  const SASSSubtarget *Subtarget = nullptr;
+
   void selectVectorLoad(SDNode *N);
   void selectVectorStore(SDNode *N);
   SDValue guard(const SDLoc &DL) {

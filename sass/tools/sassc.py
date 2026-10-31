@@ -1,8 +1,9 @@
 """CUDA -> SASS -> cubin through the LLVM SASS backend.
 
-    python tools/sassc.py kernels/saxpy.cu -o build-k/      # saxpy.ll, saxpy.sass, saxpy.<kernel>.cubin
-    python tools/sassc.py kernels/saxpy.ll -o build-k/      # start from IR
-    python tools/sassc.py kernels/saxpy.cu --llc-args=-sass-lsu-interval=0
+    python sass/tools/sassc.py sass/kernels/saxpy.cu -o out/        # saxpy.ll, saxpy.sass, saxpy.<kernel>.cubin
+    python sass/tools/sassc.py sass/kernels/saxpy.ll -o out/        # start from IR
+    python sass/tools/sassc.py --arch sm90 sass/kernels/saxpy.cu    # H100/H200 instead of GB10
+    python sass/tools/sassc.py sass/kernels/saxpy.cu --llc-args=-sass-lsu-interval=0
 
 Kernels in one module are assembled into separate cubins (the assembler takes
 one `#fn` block at a time). Dependency-checker warnings from the assembler
@@ -46,24 +47,33 @@ def kernels(sass: str) -> dict[str, str]:
     return out
 
 
+# Assembler arch -> (clang --cuda-gpu-arch, llc -mcpu). GB10's sm_121 runs
+# the sm_120 ISA; the cubin is tagged sm_121.
+ARCHES = {"sm90": ("sm_90", "sm_90"), "sm120": ("sm_120", "sm_120"),
+          "sm121": ("sm_120", "sm_121")}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("src", type=Path)
     ap.add_argument("-o", "--out", type=Path, default=Path("."))
-    ap.add_argument("--arch", default="sm121")
+    ap.add_argument("--arch", default="sm121", choices=sorted(ARCHES),
+                    help="sm90: H100/H200; sm120: RTX 50; sm121: GB10")
     ap.add_argument("--llc-args", default="", help="extra llc flags, space separated")
     opts = ap.parse_args()
     opts.out.mkdir(parents=True, exist_ok=True)
     stem = opts.src.stem
+    gpu_arch, cpu = ARCHES[opts.arch]
 
     ll = opts.src
     if opts.src.suffix == ".cu":
         ll = opts.out / f"{stem}.ll"
         run([CLANG, "-x", "cuda", "--cuda-device-only", "-nocudainc", "-nocudalib",
-             "--cuda-gpu-arch=sm_120", "-fcuda-short-ptr", "-O3", "-S", "-emit-llvm",
+             f"--cuda-gpu-arch={gpu_arch}", "-fcuda-short-ptr", "-O3", "-S", "-emit-llvm",
              "-include", str(ROOT / "kernels" / "cuda_min.h"), str(opts.src), "-o", str(ll)])
     sass_path = opts.out / f"{stem}.sass"
-    run([str(LLC), "-march=sass", "-O3", *opts.llc_args.split(), str(ll), "-o", str(sass_path)])
+    run([str(LLC), "-march=sass", f"-mcpu={cpu}", "-O3", *opts.llc_args.split(), str(ll),
+         "-o", str(sass_path)])
 
     from assembler import assemble
 

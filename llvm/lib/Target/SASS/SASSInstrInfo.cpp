@@ -52,6 +52,45 @@ void SASSInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
   report_fatal_error("SASS: unsupported register copy");
 }
 
+void SASSInstrInfo::expandAdd64(MachineInstr &MI) const {
+  MachineBasicBlock &MBB = *MI.getParent();
+  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+  const DebugLoc &DL = MI.getDebugLoc();
+  unsigned LoOpc, HiOpc;
+  switch (MI.getOpcode()) {
+  case SASS::IADD64rr: LoOpc = SASS::IADD3COrr; HiOpc = SASS::IADD3Xrr; break;
+  case SASS::IADD64ri: LoOpc = SASS::IADD3COri; HiOpc = SASS::IADD3Xri; break;
+  case SASS::ISUB64rr: LoOpc = SASS::IADD3COrn; HiOpc = SASS::IADD3Xrn; break;
+  default: llvm_unreachable("not a 64-bit add");
+  }
+  Register A = MI.getOperand(1).getReg();
+  const MachineOperand &B = MI.getOperand(2);
+  Register Lo = MRI.createVirtualRegister(&SASS::GPR32RegClass);
+  Register Hi = MRI.createVirtualRegister(&SASS::GPR32RegClass);
+  Register Carry = MRI.createVirtualRegister(&SASS::PREDRegClass);
+  auto L = BuildMI(MBB, MI, DL, get(LoOpc), Lo).addDef(Carry).addReg(A, {}, SASS::sub0);
+  auto H = BuildMI(MBB, MI, DL, get(HiOpc), Hi).addReg(A, {}, SASS::sub1);
+  if (B.isImm()) {
+    // The immediate is sign-extended: its high word is 0 or -1.
+    L.addImm(B.getImm());
+    H.addImm(B.getImm() < 0 ? -1 : 0);
+  } else {
+    L.addReg(B.getReg(), {}, SASS::sub0);
+    H.addReg(B.getReg(), {}, SASS::sub1);
+  }
+  noGuard(L);
+  noGuard(H.addReg(Carry));
+  BuildMI(MBB, MI, DL, get(TargetOpcode::REG_SEQUENCE), MI.getOperand(0).getReg())
+      .addReg(Lo)
+      .addImm(SASS::sub0)
+      .addReg(Hi)
+      .addImm(SASS::sub1);
+  MRI.clearKillFlags(A);
+  if (B.isReg())
+    MRI.clearKillFlags(B.getReg());
+  MI.eraseFromParent();
+}
+
 static bool isUncondBranch(unsigned Opc) { return Opc == SASS::BRA; }
 static bool isCondBranch(unsigned Opc) { return Opc == SASS::BRAc; }
 

@@ -3,6 +3,7 @@
 #include "SASSFrameLowering.h"
 #include "MCTargetDesc/SASSBaseInfo.h"
 #include "SASS.h"
+#include "SASSSubtarget.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -26,9 +27,13 @@ void SASSFrameLowering::emitPrologue(MachineFunction &MF,
   if (!UsesDesc)
     return;
 
-  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
-  BuildMI(MBB, MBB.begin(), DebugLoc(), TII.get(SASS::LDCU64), SASS::URD2)
-      .addImm(SASS::CBankGlobalDesc)
+  // Blackwell loads constants into uniform registers with LDCU (scoreboarded);
+  // Hopper has only the fixed-latency ULDC.
+  const auto &ST = MF.getSubtarget<SASSSubtarget>();
+  const TargetInstrInfo &TII = *ST.getInstrInfo();
+  unsigned Opc = ST.hasBlackwellISA() ? SASS::LDCU64 : SASS::ULDC64;
+  BuildMI(MBB, MBB.begin(), DebugLoc(), TII.get(Opc), SASS::URD2)
+      .addImm(ST.globalDescOffset())
       .addReg(SASS::PT)
       .addImm(0);
 }

@@ -24,6 +24,11 @@ public:
 
   const SASSRegisterInfo &getRegisterInfo() const { return RI; }
 
+  /// Splits a 64-bit add or subtract (IADD64rr, IADD64ri, ISUB64rr) into an
+  /// IADD3 with a carry-out predicate and an IADD3.X on the high words, for
+  /// Hopper, which lacks IADD.64. Needs virtual registers; erases \p MI.
+  void expandAdd64(MachineInstr &MI) const;
+
   void copyPhysReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
                    const DebugLoc &DL, Register DestReg, Register SrcReg,
                    bool KillSrc, bool RenamableDest = false,

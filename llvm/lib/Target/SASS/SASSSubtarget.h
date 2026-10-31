@@ -3,6 +3,7 @@
 #ifndef LLVM_LIB_TARGET_SASS_SASSSUBTARGET_H
 #define LLVM_LIB_TARGET_SASS_SASSSUBTARGET_H
 
+#include "MCTargetDesc/SASSMCTargetDesc.h"
 #include "SASSFrameLowering.h"
 #include "SASSISelLowering.h"
 #include "SASSInstrInfo.h"
@@ -15,6 +16,8 @@
 namespace llvm {
 
 class SASSSubtarget : public SASSGenSubtargetInfo {
+  // Set by ParseSubtargetFeatures before the members below are built.
+  bool HasBlackwellISA = false;
   SASSInstrInfo InstrInfo;
   SASSFrameLowering FrameLowering;
   SASSTargetLowering TLInfo;
@@ -26,6 +29,14 @@ public:
   ~SASSSubtarget() override;
 
   void ParseSubtargetFeatures(StringRef CPU, StringRef TuneCPU, StringRef FS);
+
+  /// sm_100+ instructions (IADD.64, LDCU) and constant-bank ABI; false on
+  /// Hopper (sm_90).
+  bool hasBlackwellISA() const { return HasBlackwellISA; }
+  /// Constant bank 0 offset of the kernel parameter block.
+  unsigned paramBase() const { return HasBlackwellISA ? 0x380 : 0x210; }
+  /// Constant bank 0 offset of the default global memory descriptor.
+  unsigned globalDescOffset() const { return HasBlackwellISA ? 0x358 : 0x208; }
 
   const SASSInstrInfo *getInstrInfo() const override { return &InstrInfo; }
   const SASSFrameLowering *getFrameLowering() const override {

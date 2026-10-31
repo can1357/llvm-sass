@@ -26,7 +26,7 @@ public:
   SASSFunctionInfo(const Function &F, const TargetSubtargetInfo *STI) {}
 
   /// Byte size of each kernel parameter slot, in order, as laid out in
-  /// constant bank 0 from 0x380 (set by SASSTargetLowering).
+  /// the constant bank 0 parameter block (set by SASSTargetLowering).
   SmallVector<unsigned, 8> ParamSizes;
 
   /// Control words assigned by SASSControlCodes, read by SASSAsmPrinter.

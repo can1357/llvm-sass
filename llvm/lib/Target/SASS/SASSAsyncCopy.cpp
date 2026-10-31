@@ -23,6 +23,7 @@
 #include "MCTargetDesc/SASSBaseInfo.h"
 #include "SASS.h"
 #include "SASSInstrInfo.h"
+#include "SASSSubtarget.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
@@ -51,7 +52,8 @@ public:
   }
 
 private:
-  const TargetInstrInfo *TII = nullptr;
+  const SASSSubtarget *ST = nullptr;
+  const SASSInstrInfo *TII = nullptr;
   MachineRegisterInfo *MRI = nullptr;
 
   MachineInstr *sourceLoad(MachineInstr &Store,
@@ -165,11 +167,14 @@ bool SASSAsyncCopy::convertBlock(MachineBasicBlock &MBB) {
       Register &Addr = Bases[{GBase, Hi}];
       if (!Addr) {
         Addr = MRI->createVirtualRegister(&SASS::GPR64RegClass);
-        BuildMI(MBB, St, DL, TII->get(SASS::IADD64ri), Addr)
-            .addReg(GBase)
-            .addImm(Hi)
-            .addReg(SASS::PT)
-            .addImm(0);
+        MachineInstr *Add =
+            BuildMI(MBB, St, DL, TII->get(SASS::IADD64ri), Addr)
+                .addReg(GBase)
+                .addImm(Hi)
+                .addReg(SASS::PT)
+                .addImm(0);
+        if (!ST->hasBlackwellISA())
+          TII->expandAdd64(*Add);
       }
       GBase = Addr;
       GOff -= Hi;
@@ -227,7 +232,8 @@ bool SASSAsyncCopy::convertBlock(MachineBasicBlock &MBB) {
 bool SASSAsyncCopy::runOnMachineFunction(MachineFunction &MF) {
   if (!Enable)
     return false;
-  TII = MF.getSubtarget().getInstrInfo();
+  ST = &MF.getSubtarget<SASSSubtarget>();
+  TII = ST->getInstrInfo();
   MRI = &MF.getRegInfo();
   bool Changed = false;
   for (MachineBasicBlock &MBB : MF)

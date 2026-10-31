@@ -259,6 +259,15 @@ SDValue SASSTargetLowering::PerformDAGCombine(SDNode *N,
   return SDValue();
 }
 
+MachineBasicBlock *
+SASSTargetLowering::EmitInstrWithCustomInserter(MachineInstr &MI,
+                                                MachineBasicBlock *MBB) const {
+  const auto &ST = MBB->getParent()->getSubtarget<SASSSubtarget>();
+  if (!ST.hasBlackwellISA())
+    ST.getInstrInfo()->expandAdd64(MI);
+  return MBB;
+}
+
 EVT SASSTargetLowering::getSetCCResultType(const DataLayout &, LLVMContext &Ctx,
                                            EVT VT) const {
   if (VT.isVector())
@@ -315,9 +324,9 @@ SDValue SASSTargetLowering::LowerFormalArguments(
     Off += Slot;
   }
 
+  unsigned ParamBase = DAG.getSubtarget<SASSSubtarget>().paramBase();
   for (const ISD::InputArg &In : Ins) {
-    unsigned CBOff =
-        SASS::CBankParamBase + Offsets[In.getOrigArgIndex()] + In.PartOffset;
+    unsigned CBOff = ParamBase + Offsets[In.getOrigArgIndex()] + In.PartOffset;
     SDValue OffV = DAG.getTargetConstant(CBOff, DL, MVT::i32);
     EVT ArgVT = In.ArgVT;
     if (In.VT == MVT::i64 || In.VT == MVT::f32) {

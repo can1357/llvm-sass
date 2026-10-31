@@ -42,13 +42,6 @@ inline const char *fpCondStr(unsigned CC) {
   return Strs[CC];
 }
 
-/// Constant bank 0 layout on sm_120: launch geometry, the default global
-/// memory descriptor and the kernel parameter block.
-enum : unsigned {
-  CBankGlobalDesc = 0x358,
-  CBankParamBase = 0x380,
-};
-
 } // namespace llvm::SASS
 
 #endif

@@ -9,6 +9,9 @@
 
 include "SASSLatency.td"
 
+def HasBlackwellISA : Predicate<"Subtarget->hasBlackwellISA()">;
+def NoBlackwellISA : Predicate<"!Subtarget->hasBlackwellISA()">;
+
 //===----------------------------------------------------------------------===//
 // Operands
 //===----------------------------------------------------------------------===//
@@ -303,7 +306,10 @@ def trunc_imm : SDNodeXForm<imm, [{
   return CurDAG->getTargetConstant((int32_t)N->getSExtValue(), SDLoc(N), MVT::i32);
 }]>;
 
-let LatMnem = LAT_IADD, SchedRW = [WriteWide] in {
+// IADD.64 exists from Blackwell. On Hopper the custom inserter
+// (SASSInstrInfo::expandAdd64) splits these into IADD3 with a carry-out
+// predicate and IADD3.X.
+let LatMnem = LAT_IADD, SchedRW = [WriteWide], usesCustomInserter = 1 in {
 def IADD64rr : SASSInst<(outs G64:$d), (ins G64:$a, G64:$b), "IADD.64 $d, $a, $b",
                         [(set i64:$d, (add i64:$a, i64:$b))]>;
 def IADD64ri : SASSInst<(outs G64:$d), (ins G64:$a, simm32:$b), "IADD.64 $d, $a, $b">;
@@ -311,6 +317,24 @@ def ISUB64rr : SASSInst<(outs G64:$d), (ins G64:$a, G64:$b), "IADD.64 $d, $a, -$
                         [(set i64:$d, (sub i64:$a, i64:$b))]>;
 }
 def : Pat<(add i64:$a, simm32_64:$b), (IADD64ri $a, (trunc_imm $b))>;
+
+// Hopper 64-bit add halves: low word with carry-out $co, high word with
+// carry-in $ci. The `n` forms negate (low) or complement (high) $b for a
+// subtraction.
+let LatMnem = LAT_IADD3, isPredicable = 0 in {
+def IADD3COrr : SASSInst<(outs GPR32:$d, PRED:$co), (ins GPR32:$a, GPR32:$b),
+                         "IADD3 $d, $co, PT, $a, $b, RZ">;
+def IADD3COri : SASSInst<(outs GPR32:$d, PRED:$co), (ins GPR32:$a, simm32:$b),
+                         "IADD3 $d, $co, PT, $a, $b, RZ">;
+def IADD3COrn : SASSInst<(outs GPR32:$d, PRED:$co), (ins GPR32:$a, GPR32:$b),
+                         "IADD3 $d, $co, PT, $a, -$b, RZ">;
+def IADD3Xrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, PRED:$ci),
+                        "IADD3.X $d, PT, PT, $a, $b, RZ, $ci, !PT">;
+def IADD3Xri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, simm32:$b, PRED:$ci),
+                        "IADD3.X $d, PT, PT, $a, $b, RZ, $ci, !PT">;
+def IADD3Xrn : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, PRED:$ci),
+                        "IADD3.X $d, PT, PT, $a, ~$b, RZ, $ci, !PT">;
+}
 
 let LatMnem = LAT_IMAD, SchedRW = [WriteWide] in {
 def IMADWrrr : SASSInst<(outs G64:$d), (ins GPR32:$a, GPR32:$b, G64:$c),
@@ -694,8 +718,13 @@ def LDC64 : SASSVarInst<(outs G64:$d), (ins simm32:$o), "LDC.64 $d, c[0x0][$o]",
                         [(set i64:$d, (SASSldc timm:$o))]>;
 }
 def : Pat<(f32 (SASSldc timm:$o)), (LDC32 timm:$o)>;
-let LatMnem = LAT_LDCU, SchedRW = [WriteLDC] in
+// Constant to uniform register: LDCU (scoreboarded) exists from Blackwell;
+// Hopper has the fixed-latency ULDC. Uniform guards cannot be expressed by
+// the PRED-typed guard operand, so neither is predicable.
+let LatMnem = LAT_LDCU, SchedRW = [WriteLDC], isPredicable = 0 in
 def LDCU64 : SASSVarInst<(outs UG64:$d), (ins simm32:$o), "LDCU.64 $d, c[0x0][$o]">;
+let LatMnem = LAT_ULDC, isPredicable = 0 in
+def ULDC64 : SASSInst<(outs UG64:$d), (ins simm32:$o), "ULDC.64 $d, c[0x0][$o]">;
 
 class S2R<string sr, Intrinsic intr>
     : SASSVarInst<(outs GPR32:$d), (ins), "S2R $d, "#sr, [(set i32:$d, (intr))]> {
@@ -710,13 +739,20 @@ def S2R_CTAIDY : S2R<"SR_CTAID.Y", int_nvvm_read_ptx_sreg_ctaid_y>;
 def S2R_CTAIDZ : S2R<"SR_CTAID.Z", int_nvvm_read_ptx_sreg_ctaid_z>;
 def S2R_LANEID : S2R<"SR_LANEID", int_nvvm_read_ptx_sreg_laneid>;
 
-// Launch geometry lives in constant bank 0 below the parameters.
-def : Pat<(int_nvvm_read_ptx_sreg_ntid_x), (LDC32 0x360)>;
-def : Pat<(int_nvvm_read_ptx_sreg_ntid_y), (LDC32 0x364)>;
-def : Pat<(int_nvvm_read_ptx_sreg_ntid_z), (LDC32 0x368)>;
-def : Pat<(int_nvvm_read_ptx_sreg_nctaid_x), (LDC32 0x370)>;
-def : Pat<(int_nvvm_read_ptx_sreg_nctaid_y), (LDC32 0x374)>;
-def : Pat<(int_nvvm_read_ptx_sreg_nctaid_z), (LDC32 0x378)>;
+// Launch geometry lives in constant bank 0: right below the parameters on
+// Blackwell, at its start on Hopper.
+multiclass Geometry<int ntid, int nctaid> {
+  def : Pat<(int_nvvm_read_ptx_sreg_ntid_x), (LDC32 ntid)>;
+  def : Pat<(int_nvvm_read_ptx_sreg_ntid_y), (LDC32 !add(ntid, 4))>;
+  def : Pat<(int_nvvm_read_ptx_sreg_ntid_z), (LDC32 !add(ntid, 8))>;
+  def : Pat<(int_nvvm_read_ptx_sreg_nctaid_x), (LDC32 nctaid)>;
+  def : Pat<(int_nvvm_read_ptx_sreg_nctaid_y), (LDC32 !add(nctaid, 4))>;
+  def : Pat<(int_nvvm_read_ptx_sreg_nctaid_z), (LDC32 !add(nctaid, 8))>;
+}
+let Predicates = [HasBlackwellISA] in
+defm : Geometry<0x360, 0x370>;
+let Predicates = [NoBlackwellISA] in
+defm : Geometry<0x0, 0xc>;
 
 //===----------------------------------------------------------------------===//
 // Control flow
