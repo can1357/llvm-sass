@@ -1,0 +1,3 @@
+[submodule "sass/sass-dec"]
+	path = sass/sass-dec
+	url = https://github.com/cicuvc/nvidia-sass-document
