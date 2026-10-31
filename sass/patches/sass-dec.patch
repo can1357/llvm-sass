@@ -1,8 +1,39 @@
 diff --git a/assembler/arch.py b/assembler/arch.py
-index 71822b9..02c7aa7 100644
+index 71822b9..938c05a 100644
 --- a/assembler/arch.py
 +++ b/assembler/arch.py
-@@ -73,6 +73,11 @@ ARCHES: dict[str, ArchConfig] = {
+@@ -38,23 +38,26 @@ class ArchConfig:
+     elf_flags: int
+     elf_osabi: int
+     elf_abiver: int
++    # UniformRegister.URZ in the ISA enum: 63 with 6-bit UR fields (up to
++    # sm_90, MAX_UNIFORM_REG_COUNT=63), 255 with Blackwell's 8-bit fields.
++    urz: int = 255
+ 
+ 
+ ARCHES: dict[str, ArchConfig] = {
+     # ELF and parameter constants are taken from a CUDA 12.8 V100 cubin.
+     "sm70": ArchConfig("sm70", "sm70.json", (0, 0), 0x160,
+-                       0x00460546, 0x33, 0x07),
++                       0x00460546, 0x33, 0x07, urz=63),
+     # Captured from a CUDA 12.1 A100 cubin.  nvcc loads the default global
+     # descriptor from c[0][0x118] into UR4/UR5 in ordinary memory kernels.
+     "sm80": ArchConfig("sm80", "sm80.json", (0, 0x118), 0x160,
+-                       0x00500550, 0x33, 0x07),
++                       0x00500550, 0x33, 0x07, urz=63),
+     # Captured from a CUDA 12.8 RTX 4090 (Ada, sm_89) cubin: same
+     # constant/parameter ABI as sm80 (desc c[0][0x118], params at 0x160);
+     # e_flags carries architecture 0x59 in both nibble pairs.
+     "sm89": ArchConfig("sm89", "sm89.json", (0, 0x118), 0x160,
+-                       0x00590559, 0x33, 0x07),
++                       0x00590559, 0x33, 0x07, urz=63),
+     "sm90": ArchConfig("sm90", "sm90.json", (0, 0x208), 0x210,
+-                        0x005a055a, 0x33, 0x07),
++                        0x005a055a, 0x33, 0x07, urz=63),
+     # B200 nvcc -arch=sm_100a cubin: Blackwell uses the same constant/param
+     # ABI and ELF ident version as sm120.  e_flags substitutes real/virtual
+     # architecture 0x64 (100) for sm120's 0x78.
+@@ -73,6 +76,11 @@ ARCHES: dict[str, ArchConfig] = {
                            0x0600670a, 0x41, 0x08),
      "sm120": ArchConfig("sm120", "sm120.json", (0, 0x358), 0x380,
                           0x06007802, 0x41, 0x08),
@@ -14,6 +45,32 @@ index 71822b9..02c7aa7 100644
  }
  DEFAULT_ARCH = "sm120"
  
+diff --git a/assembler/operand.py b/assembler/operand.py
+index 4bcb59d..f6edf0a 100644
+--- a/assembler/operand.py
++++ b/assembler/operand.py
+@@ -97,17 +97,16 @@ class Operand:
+ 
+     @staticmethod
+     def ureg(name: str, width: int = 32) -> Operand:
+-        # UniformRegister.URZ == 255 in the sm_120 ISA enum (same sentinel as
+-        # GPR RZ; UR fields are 8-bit on Blackwell, MAX_UNIFORM_REG_COUNT=80).
+         # CLASS conditions compare URd==`UniformRegister@URZ` numerically, so
+-        # the spec value (not the sm_90-era 6-bit truncation 63) is required.
+-        v = 255 if name.upper() == "URZ" else int(name[2:])
++        # URZ must be the current arch's enum value: 255 on Blackwell (8-bit
++        # UR fields), 63 on sm_90 and earlier (6-bit).
++        v = arch.current().urz if name.upper() == "URZ" else int(name[2:])
+         return Operand(OperandKind.UREG, v, width=width)
+ 
+     @staticmethod
+     def indexed_rf(name: str) -> Operand:
+         """GPR group selected by a uniform register: ``R[URx]``."""
+-        v = 255 if name.upper() == "URZ" else int(name[2:])
++        v = arch.current().urz if name.upper() == "URZ" else int(name[2:])
+         return Operand(OperandKind.INDEXED_RF, v)
+ 
+     @staticmethod
 diff --git a/assembler/sass_depcheck.py b/assembler/sass_depcheck.py
 index c572094..97bf575 100644
 --- a/assembler/sass_depcheck.py
