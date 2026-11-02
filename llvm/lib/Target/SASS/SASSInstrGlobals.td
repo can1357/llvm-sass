@@ -9,12 +9,17 @@
 class ConstBankLoad<PatFrag base, int bank>
     : PatFrag<(ops node:$ptr), (base node:$ptr),
               "return isAddrSpace(N, 4) && "
-              "SASS::constBank(*cast<MemSDNode>(N)) == " # bank # ";">;
+              "SASS::constBank(*cast<MemSDNode>(N), MF->getFunction()) == " #
+              bank # ";">;
 
 multiclass ConstLoads<string sz, RegisterOperand RC> {
   let mayLoad = 1, LatMnem = LAT_LDC, SchedRW = [WriteLDC] in {
     def "" : SASSVarInst<(outs RC:$d), (ins simm32:$bank, mems:$a),
                          "LDC"#sz#" $d, c[$bank]$a">;
+    // Banks are read-only while the kernel runs: the register allocator
+    // reloads these from the bank instead of spilling them
+    // (SASSInstrInfo::isReMaterializableImpl).
+    let isReMaterializable = 1 in
     def _I : SASSVarInst<(outs RC:$d), (ins simm32:$bank, simm32:$o),
                          "LDC"#sz#" $d, c[$bank][$o]">;
   }

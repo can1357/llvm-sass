@@ -52,8 +52,31 @@ uint64_t SASS::constOffset(const GlobalVariable &GV) {
   return Off;
 }
 
-unsigned SASS::constBank(const MemSDNode &N) {
+static bool usedIn(const Value &V, const Function &F) {
+  return any_of(V.users(), [&](const User *U) {
+    if (auto *I = dyn_cast<Instruction>(U))
+      return I->getFunction() == &F;
+    return isa<Constant>(U) && usedIn(*U, F);
+  });
+}
+
+unsigned SASS::constBank(const MemSDNode &N, const Function &F) {
   const Value *Ptr = N.getMemOperand()->getValue();
+  if (!Ptr) {
+    // The DAG combiner builds some loads without an IR pointer (a select of
+    // two loads becomes a load through a select of their addresses; see
+    // SASSTargetLowering::PerformDAGCombine). Unambiguous when F reads one
+    // bank only.
+    const GlobalVariable *Params =
+        F.getParent()->getNamedGlobal(KernelParamsSymbol);
+    bool ReadsParams = Params && usedIn(*Params, F);
+    bool ReadsData = any_of(F.getParent()->globals(),
+                            [&](const GlobalVariable &G) {
+                              return isConstData(G) && usedIn(G, F);
+                            });
+    if (ReadsParams != ReadsData)
+      return ReadsParams ? 0 : 3;
+  }
   SmallVector<const Value *, 4> Objs;
   if (Ptr)
     getUnderlyingObjects(Ptr, Objs, /*LI=*/nullptr, /*MaxLookup=*/0);
@@ -129,14 +152,6 @@ static void constBytes(const Constant *C, const DataLayout &DL,
   report_fatal_error("SASS: unsupported initializer of __constant__ variable '" +
                      GV.getName() + "' (addresses of other variables need "
                      "relocations)");
-}
-
-static bool usedIn(const Value &V, const Function &F) {
-  return any_of(V.users(), [&](const User *U) {
-    if (auto *I = dyn_cast<Instruction>(U))
-      return I->getFunction() == &F;
-    return isa<Constant>(U) && usedIn(*U, F);
-  });
 }
 
 void SASS::printConstantObjects(const Function &F, raw_ostream &OS) {

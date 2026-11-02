@@ -28,6 +28,13 @@ def memg : Operand<i64> {
   let MIOperandInfo = (ops GPR64, i32imm);
   let PrintMethod = "printGlobalAddr";
 }
+// Global address through an explicit descriptor: a uniform register pair
+// (an L2 cache policy, PTX .L2::cache_hint) instead of the default one in
+// UR4:UR5, desc[{URa,URa+1}][{Rb,Rb+1}+off].
+def memgd : Operand<i64> {
+  let MIOperandInfo = (ops UGPR64, GPR64, i32imm);
+  let PrintMethod = "printGlobalDescAddr";
+}
 def ADDRri : ComplexPattern<i64, 2, "SelectADDRri", [], []>;
 
 def G64 : RegisterOperand<GPR64, "printGroup">;
@@ -141,14 +148,14 @@ def : Pat<(i64 imm:$v), (REG_SEQUENCE GPR64, (MOVri (lo32 $v)), sub0,
 // Integer arithmetic
 //===----------------------------------------------------------------------===//
 
-let LatMnem = LAT_IADD in {
+let LatMnem = LAT_IADD, isReMaterializable = 1 in {
 def IADDrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b), "IADD $d, $a, $b",
                       [(set i32:$d, (add i32:$a, i32:$b))]>;
 def IADDri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, simm32:$b), "IADD $d, $a, $b",
                       [(set i32:$d, (add i32:$a, imm:$b))]>;
 }
 
-let LatMnem = LAT_IADD3 in {
+let LatMnem = LAT_IADD3, isReMaterializable = 1 in {
 def IADD3rrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, GPR32:$c),
                         "IADD3 $d, PT, PT, $a, $b, $c",
                         [(set i32:$d, (add (add i32:$a, i32:$b), i32:$c))]>;
@@ -161,25 +168,46 @@ def ISUBrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b),
 }
 def : Pat<(sub 0, i32:$b), (ISUBrr (i32 RZ), $b)>;
 
-let LatMnem = LAT_IMAD, SchedRW = [WriteIMAD] in {
+let LatMnem = LAT_IMAD, SchedRW = [WriteIMAD], isReMaterializable = 1 in {
 def IMADrrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, GPR32:$c),
                        "IMAD $d, $a, $b, $c",
                        [(set i32:$d, (add (mul i32:$a, i32:$b), i32:$c))]>;
 def IMADrir : SASSInst<(outs GPR32:$d), (ins GPR32:$a, simm32:$b, GPR32:$c),
                        "IMAD $d, $a, $b, $c",
                        [(set i32:$d, (add (mul i32:$a, imm:$b), i32:$c))]>;
+def IMADrri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, simm32:$c),
+                       "IMAD $d, $a, $b, $c">;
+// A left shift by log2($b) on the FMA pipe (SASSPipeBalance).
+def IMADSHLri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, simm32:$b),
+                         "IMAD.SHL.U32 $d, $a, $b, RZ">;
 def IMADHIU32 : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b),
                          "IMAD.HI.U32 $d, $a, $b, RZ",
                          [(set i32:$d, (mulhu i32:$a, i32:$b))]>;
 def IMADHI : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b),
                       "IMAD.HI $d, $a, $b, RZ",
                       [(set i32:$d, (mulhs i32:$a, i32:$b))]>;
+def IMADHIU32ri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, simm32:$b),
+                           "IMAD.HI.U32 $d, $a, $b, RZ">;
+def IMADHIri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, simm32:$b),
+                        "IMAD.HI $d, $a, $b, RZ">;
 }
 def : Pat<(mul i32:$a, i32:$b), (IMADrrr $a, $b, (i32 RZ))>;
 def : Pat<(mul i32:$a, imm:$b), (IMADrir $a, imm:$b, (i32 RZ))>;
+def negImm : SDNodeXForm<imm, [{
+  return CurDAG->getSignedTargetConstant(-N->getSExtValue(), SDLoc(N), MVT::i32);
+}]>;
+// Hopper, as ptxas: the constant of a division by a constant or a remainder's
+// multiply-subtract stays in the instruction (no MOV, no extra IADD3).
+let Predicates = [NoBlackwellISA] in {
+// a * b + imm in one IMAD (no separate add of the constant).
+def : Pat<(add (mul i32:$a, i32:$b), imm:$c), (IMADrri $a, $b, imm:$c)>;
+def : Pat<(mulhs i32:$a, imm:$b), (IMADHIri $a, imm:$b)>;
+def : Pat<(mulhu i32:$a, imm:$b), (IMADHIU32ri $a, imm:$b)>;
+def : Pat<(sub i32:$c, (mul i32:$a, imm:$b)), (IMADrir $a, (negImm imm:$b), $c)>;
+}
 
 // LOP3.LUT truth tables over a=0xf0, b=0xcc, c=0xaa.
-let LatMnem = LAT_LOP3 in {
+let LatMnem = LAT_LOP3, isReMaterializable = 1 in {
 def LOP3rrr : SASSInst<(outs GPR32:$d),
                        (ins GPR32:$a, GPR32:$b, GPR32:$c, simm32:$lut),
                        "LOP3.LUT $d, $a, $b, $c, $lut, !PT">;
@@ -192,6 +220,8 @@ def : Pat<(xor i32:$a, -1), (LOP3rrr $a, (i32 RZ), (i32 RZ), 0x0f)>;
 def : Pat<(and i32:$a, (not i32:$b)), (LOP3rrr $a, $b, (i32 RZ), 0x30)>;
 def : Pat<(xor (xor i32:$a, i32:$b), i32:$c), (LOP3rrr $a, $b, $c, 0x96)>;
 def : Pat<(or (and i32:$a, i32:$b), i32:$c), (LOP3rrr $a, $b, $c, 0xea)>;
+let Predicates = [NoBlackwellISA] in // (a & imm) | c without a MOV of imm
+def : Pat<(or (and i32:$a, imm:$b), i32:$c), (LOP3rir $a, imm:$b, $c, 0xea)>;
 def : Pat<(and (xor i32:$a, i32:$b), i32:$c), (LOP3rrr $a, $b, $c, 0x28)>;
 }
 def : Pat<(and i32:$a, i32:$b), (LOP3rrr $a, $b, (i32 RZ), 0xc0)>;
@@ -201,7 +231,7 @@ def : Pat<(and i32:$a, imm:$b), (LOP3rir $a, imm:$b, (i32 RZ), 0xc0)>;
 def : Pat<(or i32:$a, imm:$b), (LOP3rir $a, imm:$b, (i32 RZ), 0xfc)>;
 def : Pat<(xor i32:$a, imm:$b), (LOP3rir $a, imm:$b, (i32 RZ), 0x3c)>;
 
-let LatMnem = LAT_SHF in {
+let LatMnem = LAT_SHF, isReMaterializable = 1 in {
 def SHLrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b), "SHF.L.U32 $d, $a, $b, RZ",
                      [(set i32:$d, (shl i32:$a, i32:$b))]>;
 def SHLri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, simm32:$b), "SHF.L.U32 $d, $a, $b, RZ",
@@ -225,6 +255,10 @@ def SHRU64 : SASSInst<(outs GPR32:$d), (ins GPR32:$lo, simm32:$s, GPR32:$hi),
                       "SHF.R.U64 $d, $lo, $s, $hi">;
 def SHRS64 : SASSInst<(outs GPR32:$d), (ins GPR32:$lo, simm32:$s, GPR32:$hi),
                       "SHF.R.S64 $d, $lo, $s, $hi">;
+// High word of a 64-bit left shift by a register amount (0..63; the .U64
+// funnel clamps), with SHLrr's low word: ptxas's two-instruction shl.b64.
+def SHLU64HIrr : SASSInst<(outs GPR32:$d), (ins GPR32:$lo, GPR32:$s, GPR32:$hi),
+                          "SHF.L.U64.HI $d, $lo, $s, $hi">;
 }
 def NegShift32 : SDNodeXForm<imm, [{
   return CurDAG->getTargetConstant((32 - N->getZExtValue()) & 31, SDLoc(N), MVT::i32);
@@ -262,12 +296,15 @@ defvar FpCCs = [CC<SETOLT, 0>, CC<SETOLE, 1>, CC<SETOGT, 2>, CC<SETOGE, 3>,
                 CC<SETGT, 2>, CC<SETGE, 3>, CC<SETEQ, 4>, CC<SETNE, 11>];
 
 let LatMnem = LAT_ISETP, SchedRW = [WritePred] in {
+// (rematerializable on Hopper only: SASSInstrInfo::isReMaterializableImpl)
+let isReMaterializable = 1 in {
 def ISETPrr : SASSInst<(outs PRED:$p),
                        (ins GPR32:$a, GPR32:$b, icc:$cc, PRED:$c, negflag:$cn),
                        "ISETP.${cc}.AND $p, PT, $a, $b, ${cn}$c">;
 def ISETPri : SASSInst<(outs PRED:$p),
                        (ins GPR32:$a, simm32:$b, icc:$cc, PRED:$c, negflag:$cn),
                        "ISETP.${cc}.AND $p, PT, $a, $b, ${cn}$c">;
+}
 def ISETPEXrr : SASSInst<(outs PRED:$p),
                          (ins GPR32:$a, GPR32:$b, icc:$cc, PRED:$x),
                          "ISETP.${cc}.AND.EX $p, PT, $a, $b, PT, $x",
@@ -289,9 +326,26 @@ def PLOP3 : SASSInst<(outs PRED:$d), (ins PRED:$a, PRED:$b, simm32:$lut),
                      "PLOP3.LUT $d, PT, $a, $b, PT, $lut, 0x0">;
 def : Pat<(and i1:$a, i1:$b), (PLOP3 $a, $b, 0xc0)>;
 def : Pat<(or i1:$a, i1:$b), (PLOP3 $a, $b, 0xfc)>;
+// sm_90: a compare combined with another predicate by its own .AND / .OR
+// (ptxas: ISETP.GE.OR P4, PT, R6, R3, P4) instead of ISETP + PLOP3.
+let LatMnem = LAT_ISETP, SchedRW = [WritePred] in {
+def ISETPORrr : SASSInst<(outs PRED:$p),
+                         (ins GPR32:$a, GPR32:$b, icc:$cc, PRED:$c, negflag:$cn),
+                         "ISETP.${cc}.OR $p, PT, $a, $b, ${cn}$c">;
+def ISETPORri : SASSInst<(outs PRED:$p),
+                         (ins GPR32:$a, simm32:$b, icc:$cc, PRED:$c, negflag:$cn),
+                         "ISETP.${cc}.OR $p, PT, $a, $b, ${cn}$c">;
+}
+let Predicates = [NoBlackwellISA], AddedComplexity = 10 in
+foreach C = IntCCs in {
+  def : Pat<(and (setcc i32:$a, i32:$b, C.Code), i1:$c), (ISETPrr $a, $b, C.Val, $c, 0)>;
+  def : Pat<(and (setcc i32:$a, imm:$b, C.Code), i1:$c), (ISETPri $a, imm:$b, C.Val, $c, 0)>;
+  def : Pat<(or (setcc i32:$a, i32:$b, C.Code), i1:$c), (ISETPORrr $a, $b, C.Val, $c, 0)>;
+  def : Pat<(or (setcc i32:$a, imm:$b, C.Code), i1:$c), (ISETPORri $a, imm:$b, C.Val, $c, 0)>;
+}
 def : Pat<(xor i1:$a, i1:$b), (PLOP3 $a, $b, 0x3c)>;
 
-let LatMnem = LAT_SEL in {
+let LatMnem = LAT_SEL, isReMaterializable = 1 in {
 def SELrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, PRED:$p, negflag:$pn),
                      "SEL $d, $a, $b, ${pn}$p">;
 def SELri : SASSInst<(outs GPR32:$d), (ins GPR32:$a, simm32:$b, PRED:$p, negflag:$pn),
@@ -522,7 +576,8 @@ multiclass Loads<string mn, string sz, RegisterOperand RC, Operand AddrOp,
                  bit HasNC, list<SchedReadWrite> rw> {
   let mayLoad = 1, LatMnem = !cond(!eq(mn, "LDS"): LAT_LDS, !eq(mn, "LD.E"): LAT_LD,
                                    true: LAT_LDG),
-      SchedRW = rw, Uses = !if(!eq(mn, "LDS"), []<Register>, [URD2]) in {
+      SchedRW = rw,
+      Uses = !if(!or(!eq(mn, "LDS"), !eq(AddrOp, memgd)), []<Register>, [URD2]) in {
     def "" : SASSVarInst<(outs RC:$d), (ins AddrOp:$addr), mn#sz#" $d, $addr">;
     if HasNC then
       def _NC : SASSVarInst<(outs RC:$d), (ins AddrOp:$addr),
@@ -532,7 +587,8 @@ multiclass Loads<string mn, string sz, RegisterOperand RC, Operand AddrOp,
 multiclass Stores<string mn, string sz, RegisterOperand RC, Operand AddrOp> {
   let mayStore = 1, LatMnem = !cond(!eq(mn, "STS"): LAT_STS, !eq(mn, "ST.E"): LAT_ST,
                                     true: LAT_STG),
-      SchedRW = [WriteST], Uses = !if(!eq(mn, "STS"), []<Register>, [URD2]) in
+      SchedRW = [WriteST],
+      Uses = !if(!or(!eq(mn, "STS"), !eq(AddrOp, memgd)), []<Register>, [URD2]) in
   def "" : SASSVarInst<(outs), (ins AddrOp:$addr, RC:$v), mn#sz#" $addr, $v">;
 }
 
@@ -583,11 +639,38 @@ defm ST64 : Stores<"ST.E", ".64", G64, memg>;
 defm ST128 : Stores<"ST.E", ".128", G128, memg>;
 defm STU8 : Stores<"ST.E", ".U8", Op32, memg>;
 defm STU16 : Stores<"ST.E", ".U16", Op32, memg>;
+// Accesses with an L2 cache policy (SASSISD::LDH*/STH, selected in C++).
+defm LDG32_D : Loads<"LDG.E", "", Op32, memgd, 1, LdRW>;
+defm LDG64_D : Loads<"LDG.E", ".64", G64, memgd, 1, LdRW>;
+defm LDG128_D : Loads<"LDG.E", ".128", G128, memgd, 1, LdRW>;
+defm LDGU8_D : Loads<"LDG.E", ".U8", Op32, memgd, 1, LdRW>;
+defm LDGU16_D : Loads<"LDG.E", ".U16", Op32, memgd, 1, LdRW>;
+defm LD32_D : Loads<"LD.E", "", Op32, memgd, 0, LdRW>;
+defm LD64_D : Loads<"LD.E", ".64", G64, memgd, 0, LdRW>;
+defm LD128_D : Loads<"LD.E", ".128", G128, memgd, 0, LdRW>;
+defm LDU8_D : Loads<"LD.E", ".U8", Op32, memgd, 0, LdRW>;
+defm LDU16_D : Loads<"LD.E", ".U16", Op32, memgd, 0, LdRW>;
+defm STG32_D : Stores<"STG.E", "", Op32, memgd>;
+defm STG64_D : Stores<"STG.E", ".64", G64, memgd>;
+defm STG128_D : Stores<"STG.E", ".128", G128, memgd>;
+defm STGU8_D : Stores<"STG.E", ".U8", Op32, memgd>;
+defm STGU16_D : Stores<"STG.E", ".U16", Op32, memgd>;
+defm ST32_D : Stores<"ST.E", "", Op32, memgd>;
+defm ST64_D : Stores<"ST.E", ".64", G64, memgd>;
+defm ST128_D : Stores<"ST.E", ".128", G128, memgd>;
+defm STU8_D : Stores<"ST.E", ".U8", Op32, memgd>;
+defm STU16_D : Stores<"ST.E", ".U16", Op32, memgd>;
 defm STS32 : Stores<"STS", "", Op32, mems>;
 defm STS64 : Stores<"STS", ".64", G64, mems>;
 defm STS128 : Stores<"STS", ".128", G128, mems>;
 defm STSU8 : Stores<"STS", ".U8", Op32, mems>;
 defm STSU16 : Stores<"STS", ".U16", Op32, mems>;
+// Stores of zero read RZ for the whole datum (ptxas: STS.128 [R12+UR4+0x1800],
+// RZ), with no registers to clear first. Selected in selectVectorStore.
+let mayStore = 1, LatMnem = LAT_STS, SchedRW = [WriteST] in {
+def STS64Z : SASSVarInst<(outs), (ins mems:$addr), "STS.64 $addr, RZ">;
+def STS128Z : SASSVarInst<(outs), (ins mems:$addr), "STS.128 $addr, RZ">;
+}
 
 // Asynchronous global->shared copies (PTX cp.async.cg), formed by
 // SASSAsyncCopy. LDGSTS takes a shared offset of signed 20 bits and a
@@ -650,6 +733,11 @@ def HMMA16816F32 : SASSInst<(outs G128:$d), (ins G128:$a, G64:$b, G128:$c),
                             "HMMA.16816.F32 $d, $a, $b, $c">;
 def HMMA16816F32BF16 : SASSInst<(outs G128:$d), (ins G128:$a, G64:$b, G128:$c),
                                 "HMMA.16816.F32.BF16 $d, $a, $b, $c">;
+// sm_90: a +0.0 accumulator as RZ (no C reads), as ptxas emits it
+def HMMA16816F32Z : SASSInst<(outs G128:$d), (ins G128:$a, G64:$b),
+                             "HMMA.16816.F32 $d, $a, $b, RZ">;
+def HMMA16816F32BF16Z : SASSInst<(outs G128:$d), (ins G128:$a, G64:$b),
+                                 "HMMA.16816.F32.BF16 $d, $a, $b, RZ">;
 }
 
 let hasSideEffects = 1, isPredicable = 0, LatMnem = LAT_NOP in {
@@ -713,16 +801,51 @@ def SASSstv4 : SDNode<"SASSISD::STV4",
                                            SDTCisSameAs<0, 3>]>,
                       [SDNPHasChain, SDNPMayStore, SDNPMemOperand]>;
 
+// Global/generic accesses with an L2 cache policy (PTX ld/st
+// .L2::cache_hint, from the SASS::L2HintLoadFn/L2HintStoreFn builtins):
+// (chain, addr, policy[, 32-bit words]) with 1, 2 or 4 32-bit results.
+// Selected in C++ into the _D forms.
+def SASSldh1 : SDNode<"SASSISD::LDH1", SDTypeProfile<1, 2, [SDTCisVT<0, i32>]>,
+                      [SDNPHasChain, SDNPMayLoad, SDNPMemOperand]>;
+def SASSldh2 : SDNode<"SASSISD::LDH2", SDTypeProfile<2, 2, [SDTCisVT<0, i32>, SDTCisVT<1, i32>]>,
+                      [SDNPHasChain, SDNPMayLoad, SDNPMemOperand]>;
+def SASSldh4 : SDNode<"SASSISD::LDH4",
+                      SDTypeProfile<4, 2, [SDTCisVT<0, i32>, SDTCisVT<1, i32>,
+                                           SDTCisVT<2, i32>, SDTCisVT<3, i32>]>,
+                      [SDNPHasChain, SDNPMayLoad, SDNPMemOperand]>;
+def SASSsth : SDNode<"SASSISD::STH", SDTypeProfile<0, -1, []>,
+                     [SDNPHasChain, SDNPMayStore, SDNPMemOperand]>;
+
 // Base of this CTA's shared window: (CTA-in-cluster id << 24) + 0x400, past
 // the 1 KB the driver reserves at the start of shared memory.
 def SASSsmembase : SDNode<"SASSISD::SMEM_BASE", SDTypeProfile<1, 0, [SDTCisVT<0, i32>]>>;
 let LatMnem = LAT_S2R, SchedRW = [WriteS2R] in
 def S2R_CGA : SASSVarInst<(outs GPR32:$d), (ins), "S2R $d, SR_CgaCtaId">;
-let LatMnem = LAT_LEA in
+let LatMnem = LAT_LEA, isReMaterializable = 1 in
 def LEArrr : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, simm32:$s),
                       "LEA $d, $a, $b, $s",
                       [(set i32:$d, (add (shl i32:$a, (i32 imm:$s)), i32:$b))]>;
 def : Pat<(SASSsmembase), (LEArrr (S2R_CGA), (MOVri 0x400), 24)>;
+// b + (a >> (32 - s)), logical (LEA.HI) or arithmetic (.SX32): the rounding
+// and quotient steps of a signed division by a constant (Hopper, as ptxas).
+def hiShift : PatLeaf<(imm), [{
+  return N->getZExtValue() >= 1 && N->getZExtValue() <= 31;
+}]>;
+def leaHiAmt : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(32 - N->getZExtValue(), SDLoc(N), MVT::i32);
+}]>;
+let LatMnem = LAT_LEA, isReMaterializable = 1 in {
+def LEAHI : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, simm32:$s),
+                     "LEA.HI $d, $a, $b, RZ, $s">;
+def LEAHISX32 : SASSInst<(outs GPR32:$d), (ins GPR32:$a, GPR32:$b, simm32:$s),
+                         "LEA.HI.SX32 $d, $a, $b, $s">;
+}
+let Predicates = [NoBlackwellISA] in {
+def : Pat<(add (srl i32:$a, (i32 hiShift:$r)), i32:$b),
+          (LEAHI $a, $b, (leaHiAmt imm:$r))>;
+def : Pat<(add (sra i32:$a, (i32 hiShift:$r)), i32:$b),
+          (LEAHISX32 $a, $b, (leaHiAmt imm:$r))>;
+}
 
 //===----------------------------------------------------------------------===//
 // Synchronization, warp shuffles
@@ -773,6 +896,7 @@ class S2R<string sr, Intrinsic intr>
     : SASSVarInst<(outs GPR32:$d), (ins), "S2R $d, "#sr, [(set i32:$d, (intr))]> {
   let LatMnem = LAT_S2R;
   let SchedRW = [WriteS2R];
+  let isReMaterializable = 1;
 }
 def S2R_TIDX : S2R<"SR_TID.X", int_nvvm_read_ptx_sreg_tid_x>;
 def S2R_TIDY : S2R<"SR_TID.Y", int_nvvm_read_ptx_sreg_tid_y>;
@@ -848,3 +972,4 @@ include "SASSInstrGlobals.td"
 include "SASSInstrWGMMA.td"
 include "SASSInstrWarp.td"
 include "SASSInstrConv.td"
+include "SASSInstrUniform.td"

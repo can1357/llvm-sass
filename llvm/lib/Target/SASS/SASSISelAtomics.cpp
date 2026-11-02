@@ -68,6 +68,11 @@ std::optional<RMWOps> rmwOps(unsigned Opc, EVT VT) {
     if (VT == MVT::f32)
       return RMWOps{SASS::AT_FADDG, SASS::AT_FADDF, SASS::AT_FADDRG,
                     SASS::AT_FADDRF, 0};
+    // Packed halves: generic reductions are ATOM (nvcc writes RZ).
+    if (VT == MVT::v2f16)
+      return RMWOps{SASS::AT_HADD2G, SASS::AT_HADD2F, SASS::AT_HADD2RG, 0, 0};
+    if (VT == MVT::v2bf16)
+      return RMWOps{SASS::AT_BADD2G, SASS::AT_BADD2F, SASS::AT_BADD2RG, 0, 0};
     break;
   default:
     break;
@@ -142,7 +147,34 @@ private:
   SDNode *cmpSwap(AtomicSDNode *A);
   SDNode *strongLoad(MemSDNode *M, ISD::LoadExtType Ext, Scope S);
   SDNode *strongStore(MemSDNode *M, SDValue Val, Scope S);
+  SDNode *sharedLoad(AtomicSDNode *A);
 };
+
+/// A relaxed shared-memory atomic load (e.g. the initial load of a
+/// compare-and-swap loop): a plain LDS.
+SDNode *AtomicSelector::sharedLoad(AtomicSDNode *A) {
+  bool Signed = A->getExtensionType() == ISD::SEXTLOAD;
+  unsigned Opc;
+  switch (A->getMemoryVT().getSizeInBits()) {
+  case 8:
+    Opc = Signed ? SASS::LDSS8 : SASS::LDSU8;
+    break;
+  case 16:
+    Opc = Signed ? SASS::LDSS16 : SASS::LDSU16;
+    break;
+  case 32:
+    Opc = SASS::LDS32;
+    break;
+  case 64:
+    Opc = SASS::LDS64;
+    break;
+  default:
+    return nullptr;
+  }
+  SDValue Base, Off;
+  address(DAG, A->getBasePtr(), Base, Off);
+  return build(Opc, {A->getValueType(0), MVT::Other}, {Base, Off}, A->getChain());
+}
 
 SDNode *AtomicSelector::fence(AtomicOrdering Ord, Scope S, SDValue Chain) {
   // A CTA-scope MEMBAR completes asynchronously (ptxas guards it with a
@@ -301,7 +333,7 @@ SDNode *AtomicSelector::select() {
   case ISD::ATOMIC_LOAD: {
     auto *A = cast<AtomicSDNode>(N);
     if (spaceOf(A) == Shared)
-      return nullptr; // LDS is coherent within the CTA: plain patterns.
+      return sharedLoad(A); // LDS is coherent within the CTA.
     return strongLoad(A, A->getExtensionType(), scopeOf(A, Ctx));
   }
   case ISD::ATOMIC_STORE: {

@@ -61,6 +61,12 @@ bool isIntPipe(unsigned Mnem) {
 }
 /// Integer ops on the FMA pipe (IMAD) or with its timing (two-input IADD).
 bool isIntFma(unsigned Mnem) { return Mnem == LAT_IMAD || Mnem == LAT_IADD; }
+/// sm_90: the other integer ALU ops ptxas times like the int pipe (compares,
+/// selects, min/max, moves).
+bool isIntAlu90(unsigned Mnem) {
+  return isIntPipe(Mnem) || Mnem == LAT_ISETP || Mnem == LAT_SEL ||
+         Mnem == LAT_VIMNMX || Mnem == LAT_MOV;
+}
 
 unsigned tableLat(const LatencyTables &L, unsigned Prod, unsigned Cons,
                   RegKind K) {
@@ -128,6 +134,7 @@ struct FixedDef {
   unsigned Mnem = 0;
   RegKind K = RegKind::GPR;
   bool Wide = false; // 64-bit result (IMAD.WIDE, IADD.64): never tightened.
+  bool Hi = false;   // IMAD.HI: its result is late for the next IMAD.
 };
 
 /// Issue-to-use cycles from \p F to a consumer \p Cons reading as \p K.
@@ -139,12 +146,43 @@ struct FixedDef {
 /// nothing shorter than ptxas emits (a blanket 4, IMAD included, gave wrong
 /// fmix/xorshift results on GB10), and IMAD -> IMAD, 64-bit results and
 /// cross-block uses (drainLat) keep the table.
+///
+/// sm_90 (\p Hopper): ptxas's sm_90 code (lifted attention kernels) puts
+/// compares, selects, min/max and moves on the same 4-cycle footing among
+/// the int-pipe ops and 5 cycles from/to IMAD; IMAD -> IMAD 4, except
+/// after IMAD.HI (6); a compare's predicate feeds another compare or a
+/// select 4 cycles later. SEL -> ISETP is never closer than 6 there, so it
+/// keeps the table, as does the two-input IADD (int pipe or FMA pipe by
+/// form: 4 to or from IMAD made an attention kernel fault on H200).
+/// FMNMX (ALU pipe) feeds FMNMX, FSETP and MUFU 4 cycles later and FADD or
+/// SHFL 5; an HMMA.16816.F32 result feeds FADD or the next HMMA's
+/// accumulator 24 cycles after it issued (nvcc's attention softmax and
+/// QK^T chains); the table has 6 and 27/28.
 unsigned useLat(const LatencyTables &L, const FixedDef &F, unsigned Cons,
-                RegKind K) {
+                RegKind K, bool Hopper) {
   unsigned V = tableLat(L, F.Mnem, Cons, K);
+  if (Hopper && K == RegKind::GPR && F.Mnem == LAT_FMNMX) {
+    if (Cons == LAT_FMNMX || Cons == LAT_FSETP || Cons == LAT_MUFU)
+      return std::min(V, 4u);
+    if (Cons == LAT_FADD || Cons == LAT_SHFL)
+      return std::min(V, 5u);
+  }
+  if (Hopper && K == RegKind::GPR && F.Mnem == LAT_HMMA &&
+      (Cons == LAT_FADD || Cons == LAT_HMMA))
+    return std::min(V, 24u);
+  if (Hopper && K == RegKind::Pred &&
+      (F.Mnem == LAT_ISETP || F.Mnem == LAT_LOP3) &&
+      (Cons == LAT_ISETP || Cons == LAT_SEL))
+    return std::min(V, 4u);
   if (K != RegKind::GPR || F.Wide)
     return V;
   bool PI = isIntPipe(F.Mnem), CI = isIntPipe(Cons);
+  if (Hopper) {
+    PI = isIntAlu90(F.Mnem) && !(F.Mnem == LAT_SEL && Cons == LAT_ISETP);
+    CI = isIntAlu90(Cons);
+    if (F.Mnem == LAT_IMAD && Cons == LAT_IMAD && !F.Hi)
+      return std::min(V, 4u);
+  }
   if (PI && CI)
     return std::min(V, 4u);
   if ((PI && isIntFma(Cons)) || (isIntFma(F.Mnem) && CI))
@@ -170,6 +208,8 @@ private:
   /// The function has tensor-core instructions, whose results can take
   /// longer than one stall field: blocks drain before their terminators.
   bool DrainBeforeTerminators = false;
+  /// sm_90: reuse bits on HMMA sources; guarded scoreboard claims tracked.
+  bool Hopper = false;
   /// Highest write scoreboard for results: below SASS::AsyncCopySB when the
   /// function commits async copies to it.
   unsigned LastResultSB = LastWriteSB;
@@ -200,42 +240,130 @@ static bool isConstReg(Register R) {
   return R == SASS::RZ || R == SASS::PT || R == SASS::URZ;
 }
 
-/// Instructions whose explicit sources map 1:1 onto SASS slots a, b, c and
-/// whose encodings accept reuse bits.
-static bool reuseCapable(unsigned Opc) {
-  switch (Opc) {
+static cl::opt<bool> WideReuse(
+    "sass-wide-reuse", cl::init(true),
+    cl::desc("Hopper: reuse bits on the integer and packed-half forms too, "
+             "held across instructions that do not read the slot"));
+
+/// What an instruction whose encoding accepts reuse bits reads in SASS
+/// source slots a, b, c: Reg[S] is the GPR (tuple) read there, if any, and
+/// Busy[S] is set when the slot reads any register (constant and uniform
+/// registers included); false for other instructions. \p MMA admits sm_90's
+/// HMMAs; \p H90 (Hopper, sass-wide-reuse) adds
+/// the integer and packed-half forms of ptxas's dequantizing loops.
+static bool reuseSlots(const MachineInstr &MI, bool MMA, bool H90, Register (&Reg)[3],
+                       bool (&Busy)[3]) {
+  for (unsigned S = 0; S < 3; ++S) {
+    Reg[S] = Register();
+    Busy[S] = false;
+  }
+  unsigned N = MI.getDesc().getNumDefs();
+  auto Slot = [&](unsigned S, unsigned I) {
+    if (N + I >= MI.getNumExplicitOperands() || MI.findFirstPredOperandIdx() == int(N + I))
+      return;
+    const MachineOperand &MO = MI.getOperand(N + I);
+    if (!MO.isReg())
+      return;
+    Busy[S] = true;
+    Register R = MO.getReg();
+    if (!isConstReg(R) && !SASS::UGPR32RegClass.contains(R) &&
+        !SASS::UGPR64RegClass.contains(R))
+      Reg[S] = R;
+  };
+  auto OneToOne = [&] {
+    for (unsigned S = 0; S < 3; ++S)
+      Slot(S, S);
+    return true;
+  };
+  switch (MI.getOpcode()) {
+  // sm_90: ptxas keeps a shared A fragment of back-to-back HMMAs in the
+  // reuse cache (fewer register-file reads per MMA).
+  case SASS::HMMA16816F32: case SASS::HMMA16816F32BF16:
+  case SASS::HMMA16816F32Z: case SASS::HMMA16816F32BF16Z:
+    return MMA && OneToOne();
   case SASS::FFMArrr: case SASS::FFMArir: case SASS::FFMArri:
   case SASS::FFMArrn: case SASS::FFMAnrr: case SASS::FMULrr:
   case SASS::FMULri: case SASS::FADDrr: case SASS::FADDri:
   case SASS::FSUBrr: case SASS::IMADrrr: case SASS::IMADrir:
   case SASS::LOP3rrr: case SASS::LOP3rir: case SASS::IADD3rrr:
+    return OneToOne();
+  // Sources in slot order: IMAD a, b, c; SHF.L.U32 a, imm, RZ; PRMT a, imm,
+  // c; LEA a, b; HMUL2/HFMA2 a, b(, c).
+  case SASS::IMADrri: case SASS::PRMTrir: case SASS::LEArrr:
+  case SASS::HBF16X2MUL: case SASS::HBF16X2FMA:
+  case SASS::HF16X2MUL: case SASS::HF16X2FMA:
+    return H90 && OneToOne();
+  case SASS::IMADSHLri: case SASS::SHLri: // slot c reads RZ
+    if (!H90)
+      return false;
+    OneToOne();
+    Busy[2] = true;
+    return true;
+  case SASS::ROTLri: // SHF.L.W.U32.HI d, a, imm, a
+    if (!H90)
+      return false;
+    Slot(0, 0);
+    Slot(2, 0);
+    return true;
+  case SASS::SRAri: case SASS::SRLri: // SHF.R.*.HI d, RZ, imm, a
+    if (!H90)
+      return false;
+    Busy[0] = true;
+    Slot(2, 0);
+    return true;
+  case SASS::IADD3rri: // IADD3 d, PT, PT, a, imm, b
+    if (!H90)
+      return false;
+    Slot(0, 0);
+    Slot(2, 1);
     return true;
   default:
     return false;
   }
 }
 
-// The operand reuse cache keeps a source for exactly the next instruction,
-// per slot. Never on a source the instruction also writes (the successor
-// would read the stale value), and only with the trans (yield 0) usched form
-// and stalls <= 11.
-template <typename SlotVec> static void setReuseBits(SlotVec &Out) {
+// The operand reuse cache keeps a slot's source for the next instruction
+// that reads a register in that slot: a reuse bit lets it take the value
+// from the cache instead of the register file. Never on a source the
+// instruction also writes (the reader would get the stale value), and only
+// with the trans (yield 0) usched form and stalls <= 11. Before Hopper the
+// reader must be the next instruction. On Hopper the cache also holds the
+// value across up to 3 instructions with an immediate (or nothing) in that
+// slot, as ptxas uses it (HMUL2 R114, R87, R84.reuse; LOP3 R133, R112, imm,
+// RZ; HMUL2 R112, R113, R84): every instruction it passes keeps the trans
+// form (\p Hold). Halves each warp's register-file reads in dequantizing
+// loops, whose two parity banks serve one operand per clock per sub-core.
+template <typename SlotVec>
+static void setReuseBits(SlotVec &Out, bool MMA, bool H90, SmallVectorImpl<bool> &Hold) {
+  Hold.assign(Out.size(), false);
+  const size_t Reach = H90 ? 4 : 1;
   for (size_t I = 0; I + 1 < Out.size(); ++I) {
-    MachineInstr *A = Out[I].MI, *B = Out[I + 1].MI;
-    if (!A || !B || !reuseCapable(A->getOpcode()) ||
-        !reuseCapable(B->getOpcode()) || Out[I].C.Stall > MaxTransStall)
+    MachineInstr *A = Out[I].MI;
+    Register RA[3];
+    bool BA[3];
+    if (!A || Out[I].C.Stall > MaxTransStall || !reuseSlots(*A, MMA, H90, RA, BA))
       continue;
-    unsigned NA = A->getDesc().getNumDefs(), NB = B->getDesc().getNumDefs();
     unsigned Bits = 0;
     for (unsigned S = 0; S < 3; ++S) {
-      if (NA + S >= A->getNumExplicitOperands() || NB + S >= B->getNumExplicitOperands())
-        break;
-      const MachineOperand &OA = A->getOperand(NA + S), &OB = B->getOperand(NB + S);
-      if (!OA.isReg() || !OB.isReg() || OA.getReg() != OB.getReg() ||
-          isConstReg(OA.getReg()) || A->modifiesRegister(OA.getReg(), nullptr) ||
-          A->findFirstPredOperandIdx() == int(NA + S))
+      if (!RA[S] || A->modifiesRegister(RA[S], nullptr))
         continue;
-      Bits |= 1u << S;
+      for (size_t J = I + 1; J < Out.size() && J <= I + Reach; ++J) {
+        MachineInstr *B = Out[J].MI;
+        Register RB[3];
+        bool BB[3];
+        if (!B || !reuseSlots(*B, MMA, H90, RB, BB))
+          break;
+        if (BB[S]) {
+          if (RB[S] == RA[S]) {
+            Bits |= 1u << S;
+            for (size_t K = I + 1; K < J; ++K)
+              Hold[K] = true;
+          }
+          break;
+        }
+        if (Out[J].C.Stall > MaxTransStall || B->modifiesRegister(RA[S], nullptr))
+          break;
+      }
     }
     if (Bits)
       Out[I].C.Reuse = Bits;
@@ -263,13 +391,27 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
     unsigned Mnem = 0;
   };
   SmallVector<SlowRead, 0> Slow(NumUnits);
+  // Uniform-datapath ALU reads (UIADD3, UIMAD, ULOP3, ...) are slow reads
+  // too: TABLE_ANTI(UGPR) has ULDC/UMOV overwrite their sources only 3
+  // cycles after they issued (1 for other writers).
+  auto AntiLat = [&](unsigned Reader, unsigned Writer) -> unsigned {
+    if (Reader == LAT_UIADD3)
+      return Writer == LAT_ULDC || Writer == LAT_UMOV ? 3 : 1;
+    return Lat->AntiGPR[Reader][Writer];
+  };
   auto MaxAnti = [&](unsigned Reader) {
+    if (Reader == LAT_UIADD3)
+      return 3u;
     unsigned V = 1;
     for (unsigned W = 0; W < NumLatMnem; ++W)
       V = std::max<unsigned>(V, Lat->AntiGPR[Reader][W]);
     return V;
   };
   int SBSet[6] = {Never, Never, Never, Never, Never, Never};
+  // sm_90: a guarded producer's claim is pending on the scoreboard; a new
+  // producer waits for it before sharing the scoreboard (the assembler's
+  // dependency check rejects retargeting it, e.g. if-converted LDS chains).
+  bool SBGuarded[6] = {};
   // wgmma and setmaxnreg (ptxas's GMMA_SCOREBOARD, GMMA_GROUP_SCOREBOARD
   // and RPC tables): GMMA issues 6 cycles after WARPGROUP.ARRIVE; DEPBAR,
   // EXIT and the next gsb0 GMMA 3 after a gsb0 GMMA; USETMAXREG 9 after the
@@ -293,20 +435,29 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
   // those results should have landed by now (short-latency producers set
   // long enough ago), the new producer waits for them first and takes the
   // scoreboard over, as ptxas does. Long-latency (global) results are shared.
-  auto PickWriteSB = [&](bool &WaitFirst) {
+  // With every scoreboard pending, a global load (\p NewLat 400) joins one
+  // that already counts global loads from this block, else the oldest: on a
+  // scoreboard of short results (an LDS, possibly unread on another path
+  // into a later join) it would make their readers wait for memory.
+  auto PickWriteSB = [&](bool &WaitFirst, int NewLat) {
     uint8_t Pending = 0;
     for (unsigned U = 0; U < NumUnits; ++U)
       Pending |= S.Wr[U];
-    unsigned Best = FirstWriteSB;
+    unsigned Best = FirstWriteSB, Long = 0;
     for (unsigned SB = FirstWriteSB; SB <= LastResultSB; ++SB) {
-      if (!(Pending & (1u << SB))) {
+      if (!(Pending & (1u << SB)) && !SBGuarded[SB]) {
         SBLat[SB] = 0;
         return SB;
       }
       if (SBSet[SB] < SBSet[Best])
         Best = SB;
+      if (Hopper && SBLat[SB] >= NewLat && !SBGuarded[SB] &&
+          (!Long || SBSet[SB] < SBSet[Long]))
+        Long = SB;
     }
-    WaitFirst = T - SBSet[Best] >= SBLat[Best];
+    if (NewLat >= resultLat(LAT_LDG) && Long)
+      Best = Long;
+    WaitFirst = T - SBSet[Best] >= SBLat[Best] || SBGuarded[Best];
     return Best;
   };
 
@@ -386,10 +537,10 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
           Req |= S.Rd[U]; // WAR against a late reader.
         if (MO.isDef() && Slow[U].Issue != Never)
           Need = std::max<int>(Need, Slow[U].Issue +
-                                         Lat->AntiGPR[Slow[U].Mnem][M]);
+                                         AntiLat(Slow[U].Mnem, M));
         const FixedDef &F = Fixed[U];
         if (F.Issue != Never)
-          Need = std::max<int>(Need, F.Issue + useLat(*Lat, F, M, K));
+          Need = std::max<int>(Need, F.Issue + useLat(*Lat, F, M, K, Hopper));
       }
     }
     unsigned Opc = MI.getOpcode();
@@ -421,8 +572,10 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
     Req |= NextReq;
     NextReq = 0;
     for (unsigned SB = 0; SB < 6; ++SB)
-      if (Req & (1u << SB))
+      if (Req & (1u << SB)) {
         Need = std::max(Need, SBSet[SB] + SBSetDelay);
+        SBGuarded[SB] = false;
+      }
     if (Need > T) {
       Delay(Need - T, &MI);
       T = Need;
@@ -444,8 +597,12 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
       }
     }
     if (SASS::writesSB(D) && HasDefs) {
+      // A run of mbarrier inits completes together before the barriers are
+      // used (ptxas counts them all on one scoreboard): shared like global
+      // loads, not taken over one by one, each takeover waiting out an init.
+      int NewLat = MI.getOpcode() == SASS::SYNCS_EXCH ? resultLat(LAT_LDG) : resultLat(M);
       bool WaitFirst = false;
-      C.Wr = PickWriteSB(WaitFirst);
+      C.Wr = PickWriteSB(WaitFirst, NewLat);
       if (WaitFirst) {
         C.Req |= 1u << C.Wr;
         for (unsigned U = 0; U < NumUnits; ++U) {
@@ -453,9 +610,11 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
           S.Rd[U] &= ~(1u << C.Wr);
         }
         SBLat[C.Wr] = 0;
+        SBGuarded[C.Wr] = false;
       }
       SBSet[C.Wr] = T;
-      SBLat[C.Wr] = std::max(SBLat[C.Wr], resultLat(M));
+      SBLat[C.Wr] = std::max(SBLat[C.Wr], NewLat);
+      SBGuarded[C.Wr] |= Hopper && TII->isPredicated(MI);
     }
     if (MI.getOpcode() == SASS::LDGDEPBAR) {
       C.Wr = SASS::AsyncCopySB;
@@ -465,7 +624,7 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
     // waits on (as ptxas emits it).
     if (MI.getOpcode() == SASS::USETMAXREG_DEALLOC) {
       bool WaitFirst = false;
-      C.Wr = PickWriteSB(WaitFirst);
+      C.Wr = PickWriteSB(WaitFirst, resultLat(M));
       if (WaitFirst)
         C.Req |= 1u << C.Wr;
       SBSet[C.Wr] = T;
@@ -502,11 +661,15 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
             S.Wr[U] = 1u << C.Wr;
             Fixed[U] = FixedDef();
           } else {
-            Fixed[U] = {T, M, K, Wide};
+            Fixed[U] = {T, M, K, Wide,
+                        Opc == SASS::IMADHIU32 || Opc == SASS::IMADHI ||
+                            Opc == SASS::IMADHIU32ri || Opc == SASS::IMADHIri};
           }
         } else if (C.Rd != 7 && (int)I != Guard) {
           S.Rd[U] |= 1u << ReadSB;
-        } else if (M == LAT_HMMA && (int)I != Guard) {
+        } else if ((M == LAT_HMMA ||
+                    (M == LAT_UIADD3 && K == RegKind::UGPR)) &&
+                   (int)I != Guard) {
           Slow[U] = {T, M};
         }
       }
@@ -529,10 +692,11 @@ SBState SASSControlCodes::processBlock(MachineBasicBlock &MBB, SBState S,
     // A yield switches warps at the cost of one dead issue cycle (sm120
     // measurements), so like ptxas only yield where the warp stalls for 3+
     // cycles anyway; never with reuse bits, always past the trans form.
-    setReuseBits(Out);
-    for (Slot &Sl : Out) {
+    SmallVector<bool, 0> Hold;
+    setReuseBits(Out, Hopper, Hopper && WideReuse, Hold);
+    for (auto [K, Sl] : enumerate(Out)) {
       Sl.C.Yield = Sl.C.Stall > MaxTransStall ||
-                   (Sl.C.Stall >= YieldStall && !Sl.C.Reuse);
+                   (Sl.C.Stall >= YieldStall && !Sl.C.Reuse && !Hold[K]);
       Commit->Ctrl[Sl.MI] = Sl.C;
     }
   }
@@ -544,6 +708,7 @@ bool SASSControlCodes::runOnMachineFunction(MachineFunction &MF) {
   TRI = ST.getRegisterInfo();
   TII = ST.getInstrInfo();
   Lat = ST.hasBlackwellISA() ? &SM120Latencies : &SM90Latencies;
+  Hopper = !ST.hasBlackwellISA();
   Consumers = 0;
   for (const MachineBasicBlock &B : MF)
     for (const MachineInstr &MI : B)

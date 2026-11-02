@@ -41,6 +41,8 @@ public:
   void printFCC(const MCInst *MI, unsigned OpNo, raw_ostream &O);
   void printBrTarget(const MCInst *MI, unsigned OpNo, raw_ostream &O);
   void printGlobalAddr(const MCInst *MI, unsigned OpNo, raw_ostream &O);
+  /// desc[{URa,URa+1}][{Rb,Rb+1}+off]: an explicit (cache-policy) descriptor.
+  void printGlobalDescAddr(const MCInst *MI, unsigned OpNo, raw_ostream &O);
   void printSharedAddr(const MCInst *MI, unsigned OpNo, raw_ostream &O);
   /// Global address without the descriptor: `[{Ra,Ra+1}+off]` (ATOM*.CAS).
   void printRawGlobalAddr(const MCInst *MI, unsigned OpNo, raw_ostream &O);

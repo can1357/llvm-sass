@@ -2,7 +2,8 @@
 //
 // Operation actions for f32 rounding (FRND, SASSInstrConv.td) and f64
 // (conversions, DADD/DMUL/DFMA/DSETP; the rest expands or is unsupported),
-// and the builtin call SASSLowerIEEE emits for FCHK.
+// and the builtin call SASSLowerIEEE emits for FCHK (the L2 cache-hint
+// builtins are SASSISelPTX's).
 //
 //===----------------------------------------------------------------------===//
 
@@ -34,6 +35,8 @@ void SASSTargetLowering::initConvActions() {
 
 SDValue SASSTargetLowering::lowerBuiltinCall(CallLoweringInfo &CLI,
                                              SmallVectorImpl<SDValue> &InVals) const {
+  if (SDValue Chain = lowerL2HintCall(CLI, InVals))
+    return Chain;
   auto *G = dyn_cast<GlobalAddressSDNode>(CLI.Callee);
   if (!G || G->getGlobal()->getName() != SASS::FChkFn)
     return SDValue();

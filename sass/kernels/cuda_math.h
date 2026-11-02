@@ -4896,18 +4896,29 @@ SASS_MATH_FN(int, __clzll)(long long x) { return (int)__sm_clz64((unsigned long 
 SASS_MATH_FN(int, __ffs)(int x) { return x == 0 ? 0 : (int)__sm_clz32(__sm_brev32((unsigned)x)) + 1; }
 SASS_MATH_FN(int, __ffsll)(long long x) { return x == 0 ? 0 : (int)__sm_clz64(__sm_brev64((unsigned long long)x)) + 1; }
 // PTX fns.b32: the |offset|-th set bit of mask counting from bit base (inclusive), upward for offset > 0, downward
-// for offset < 0; offset 0 tests bit base. 0xffffffff when there is none.
+// for offset < 0; offset 0 tests bit base. 0xffffffff when there is none. Without loops, as ptxas: the bits at or
+// past base (bit-reversed when counting downward), then a POPC-guided binary search for the n-th of them (a scan
+// bit by bit cost the tiny MoE kernel's first-unit issue ~0.7 us per call).
 SASS_MATH_FN(unsigned, __fns)(unsigned mask, unsigned base, int offset) {
   if (offset == 0)
     return base < 32 && ((mask >> base) & 1) ? base : 0xffffffffu;
-  int count = (offset > 0 ? offset : -offset) - 1, inc = offset > 0 ? 1 : -1;
-  for (int pos = (int)base; pos >= 0 && pos < 32; pos += inc)
-    if ((mask >> pos) & 1) {
-      if (count == 0)
-        return (unsigned)pos;
-      --count;
-    }
-  return 0xffffffffu;
+  const bool up = offset > 0;
+  unsigned n = (unsigned)(up ? offset : -offset) - 1;
+  unsigned m = base > 31 ? 0u : up ? mask & (0xffffffffu << base) : mask & (0xffffffffu >> (31 - base));
+  if (!up)
+    m = __sm_brev32(m);
+  if (__sm_popc32(m) <= n)
+    return 0xffffffffu;
+  unsigned pos = 0;
+#pragma unroll
+  for (unsigned w = 16; w; w >>= 1) {
+    const unsigned c = __sm_popc32(m & ((1u << w) - 1u));
+    const bool skip = n >= c;
+    n = skip ? n - c : n;
+    m = skip ? m >> w : m;
+    pos = skip ? pos + w : pos;
+  }
+  return up ? pos : 31 - pos;
 }
 SASS_MATH_FN(unsigned, __brev)(unsigned x) { return __sm_brev32(x); }
 SASS_MATH_FN(unsigned long long, __brevll)(unsigned long long x) { return __sm_brev64(x); }

@@ -47,6 +47,31 @@ public:
   bool runOnFunction(Function &F) override;
 };
 
+/// \p V is >= 0 or NaN: an ex2.approx result, x * x, or a select of such.
+static bool nonNegative(const Value *V, unsigned Depth = 0) {
+  if (Depth > 4)
+    return false;
+  if (match(V, m_Intrinsic<Intrinsic::nvvm_ex2_approx_ftz>()) ||
+      match(V, m_Intrinsic<Intrinsic::nvvm_ex2_approx>()))
+    return true;
+  const Value *A, *C;
+  if (match(V, m_FMul(m_Value(A), m_Deferred(A))))
+    return true;
+  if (match(V, m_Select(m_Value(), m_Value(A), m_Value(C))))
+    return nonNegative(A, Depth + 1) && nonNegative(C, Depth + 1);
+  return false;
+}
+
+/// \p Y is >= 1 or NaN, so never denormal: a non-negative value plus a
+/// constant >= 1 (the `1 + __expf(-x)` of a sigmoid).
+static bool atLeastOne(const Value *Y) {
+  const Value *A;
+  const APFloat *C;
+  return match(Y, m_c_FAdd(m_Value(A), m_APFloat(C))) && !C->isNaN() &&
+         C->compare(APFloat(C->getSemantics(), 1)) != APFloat::cmpLessThan &&
+         nonNegative(A);
+}
+
 /// Builds approximate operations in front of one instruction.
 class Approx {
   IRBuilder<> B;
@@ -124,19 +149,28 @@ public:
   /// div.approx.f32 (\p Full false): x * rcp(y), scaling both by 2^24 for a
   /// denormal y. div.full.f32 also scales both by 1/4 for |y| > 2^126, whose
   /// reciprocal would be denormal; nvcc divides so with -prec-div=false.
-  /// Flush-to-zero, both are x * rcp(y) as under --use_fast_math.
+  /// Flush-to-zero, both are x * rcp(y) as under --use_fast_math. A y known
+  /// to be >= 1 needs no denormal scaling, as nvcc finds (sm_90).
   Value *div(Value *X, Value *Y, bool Full) {
     if (FTZ)
       return B.CreateFMul(X, prim(Intrinsic::nvvm_rcp_approx_ftz_f, Y));
     IRBuilder<>::FastMathFlagGuard G(B);
     B.clearFastMathFlags();
-    Value *P = normal(Y);
+    bool NoDenorm = B.GetInsertBlock()
+                        ->getParent()
+                        ->getFnAttribute("target-cpu")
+                        .getValueAsString()
+                        .starts_with("sm_90") &&
+                    atLeastOne(Y);
+    Value *P = NoDenorm ? nullptr : normal(Y);
     if (Full) {
       Value *Huge = B.CreateFCmpOGT(B.CreateUnaryIntrinsic(Intrinsic::fabs, Y),
                                     c(0x1p126f));
       X = B.CreateSelect(Huge, B.CreateFMul(X, c(0.25f)), X);
       Y = B.CreateSelect(Huge, B.CreateFMul(Y, c(0.25f)), Y);
     }
+    if (NoDenorm)
+      return B.CreateFMul(prim(Intrinsic::nvvm_rcp_approx_ftz_f, Y), X);
     Value *R = prim(Intrinsic::nvvm_rcp_approx_ftz_f, scaleUnless(P, Y, 0x1p24f));
     return B.CreateFMul(R, scaleUnless(P, X, 0x1p24f));
   }

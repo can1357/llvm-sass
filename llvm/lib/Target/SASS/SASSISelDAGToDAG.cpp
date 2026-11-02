@@ -54,13 +54,17 @@ private:
   const SASSSubtarget *Subtarget = nullptr;
 
   /// BRCOND of a block whose IR terminator is warp-uniform -> BRAcu.
+  /// A BRCOND on a promoted i1 compared with 0/1 -> on the i1 itself.
+  SDNode *foldPredicateCompare(SDNode *N);
   bool selectUniformBranch(SDNode *N);
   void selectVectorLoad(SDNode *N);
   void selectVectorStore(SDNode *N);
+  /// LDH1/LDH2/LDH4/STH: global/generic accesses with an L2 cache policy.
+  void selectPolicyAccess(SDNode *N);
   /// Tensor-core, matrix and async-copy intrinsics; false if \p N is
   /// another intrinsic (left to the generated matcher).
   bool selectIntrinsic(SDNode *N);
-  void selectMMA(SDNode *N, unsigned Opc);
+  void selectMMA(SDNode *N, unsigned Opc, unsigned ZeroAccOpc);
   void selectMatrixLoad(SDNode *N, unsigned Opc, unsigned Count);
   void selectMatrixStore(SDNode *N, unsigned Opc, unsigned Count);
   void selectAsyncCopy(SDNode *N, unsigned Opc);
@@ -119,6 +123,11 @@ void SASSDAGToDAGISel::Select(SDNode *N) {
   case SASSISD::STV2:
   case SASSISD::STV4:
     return selectVectorStore(N);
+  case SASSISD::LDH1:
+  case SASSISD::LDH2:
+  case SASSISD::LDH4:
+  case SASSISD::STH:
+    return selectPolicyAccess(N);
   case ISD::INTRINSIC_WO_CHAIN:
   case ISD::INTRINSIC_W_CHAIN:
   case ISD::INTRINSIC_VOID:
@@ -127,6 +136,7 @@ void SASSDAGToDAGISel::Select(SDNode *N) {
       return;
     break;
   case ISD::BRCOND:
+    N = foldPredicateCompare(N);
     if (selectUniformBranch(N))
       return;
     break;
@@ -134,6 +144,36 @@ void SASSDAGToDAGISel::Select(SDNode *N) {
     break;
   }
   SelectCode(N);
+}
+
+/// `brcond (setcc (zext p), 0|1, eq|ne)`: a branch on an i1 that the type
+/// legalizer promoted (e.g. an inverted mbarrier try_wait result, as a
+/// fallthrough loop exit) becomes a branch on p or !p, not SEL + ISETP.
+SDNode *SASSDAGToDAGISel::foldPredicateCompare(SDNode *N) {
+  SDValue Cond = N->getOperand(1);
+  if (Cond.getOpcode() != ISD::SETCC || !Cond.hasOneUse())
+    return N;
+  auto *C = dyn_cast<ConstantSDNode>(Cond.getOperand(1));
+  ISD::CondCode CC = cast<CondCodeSDNode>(Cond.getOperand(2))->get();
+  if (!C || C->getZExtValue() > 1 || (CC != ISD::SETEQ && CC != ISD::SETNE))
+    return N;
+  SDValue X = Cond.getOperand(0), P;
+  if (X.getOpcode() == ISD::ZERO_EXTEND &&
+      X.getOperand(0).getValueType() == MVT::i1)
+    P = X.getOperand(0);
+  else if (X.getOpcode() == ISD::SELECT && isOneConstant(X.getOperand(1)) &&
+           isNullConstant(X.getOperand(2)))
+    P = X.getOperand(0);
+  if (!P)
+    return N;
+  SDLoc DL(N);
+  if ((CC == ISD::SETNE) == (C->getZExtValue() == 1))
+    P = CurDAG->getNode(ISD::XOR, DL, MVT::i1, P,
+                        CurDAG->getAllOnesConstant(DL, MVT::i1));
+  N = CurDAG->UpdateNodeOperands(N, N->getOperand(0), P, N->getOperand(2));
+  if (Cond->use_empty())
+    CurDAG->RemoveDeadNode(Cond.getNode());
+  return N;
 }
 
 bool SASSDAGToDAGISel::selectUniformBranch(SDNode *N) {
@@ -162,10 +202,10 @@ bool SASSDAGToDAGISel::selectIntrinsic(SDNode *N) {
   SDLoc DL(N);
   switch (ID) {
   case Intrinsic::nvvm_mma_m16n8k16_row_col_f32_f32:
-    selectMMA(N, SASS::HMMA16816F32);
+    selectMMA(N, SASS::HMMA16816F32, SASS::HMMA16816F32Z);
     return true;
   case Intrinsic::nvvm_mma_m16n8k16_row_col_bf16:
-    selectMMA(N, SASS::HMMA16816F32BF16);
+    selectMMA(N, SASS::HMMA16816F32BF16, SASS::HMMA16816F32BF16Z);
     return true;
   case Intrinsic::nvvm_ldmatrix_sync_aligned_m8n8_x1_b16:
     selectMatrixLoad(N, SASS::MAT1_LD, 1);
@@ -262,14 +302,26 @@ SDValue SASSDAGToDAGISel::tuple(const SDLoc &DL, ArrayRef<SDValue> Vals) {
 }
 
 // mma.m16n8k16 (id, a0..a3, b0..b1, c0..c3) -> HMMA on register tuples.
-void SASSDAGToDAGISel::selectMMA(SDNode *N, unsigned Opc) {
+void SASSDAGToDAGISel::selectMMA(SDNode *N, unsigned Opc, unsigned ZeroAccOpc) {
   SDLoc DL(N);
   auto Op = [&](unsigned I) { return N->getOperand(1 + I); };
-  SDValue Ops[] = {tuple(DL, {Op(0), Op(1), Op(2), Op(3)}),
-                   tuple(DL, {Op(4), Op(5)}),
-                   tuple(DL, {Op(6), Op(7), Op(8), Op(9)}), guard(DL),
-                   CurDAG->getTargetConstant(0, DL, MVT::i32)};
-  MachineSDNode *MMA = CurDAG->getMachineNode(Opc, DL, MVT::Untyped, Ops);
+  // sm_90: a +0.0 accumulator is RZ, as ptxas emits it (no zeroed tuple
+  // to keep live and no C register reads).
+  auto PosZero = [](SDValue V) {
+    if (auto *C = dyn_cast<ConstantFPSDNode>(V))
+      return C->isZero() && !C->isNegative();
+    return isNullConstant(V);
+  };
+  bool ZeroAcc = !Subtarget->hasBlackwellISA() && PosZero(Op(6)) &&
+                 PosZero(Op(7)) && PosZero(Op(8)) && PosZero(Op(9));
+  SmallVector<SDValue, 5> Ops = {tuple(DL, {Op(0), Op(1), Op(2), Op(3)}),
+                                 tuple(DL, {Op(4), Op(5)})};
+  if (!ZeroAcc)
+    Ops.push_back(tuple(DL, {Op(6), Op(7), Op(8), Op(9)}));
+  Ops.push_back(guard(DL));
+  Ops.push_back(CurDAG->getTargetConstant(0, DL, MVT::i32));
+  MachineSDNode *MMA = CurDAG->getMachineNode(ZeroAcc ? ZeroAccOpc : Opc, DL,
+                                              MVT::Untyped, Ops);
   for (unsigned I = 0; I < 4; ++I)
     ReplaceUses(SDValue(N, I), CurDAG->getTargetExtractSubreg(
                                    SubIdx[I], DL, MVT::f32, SDValue(MMA, 0)));
@@ -451,12 +503,90 @@ void SASSDAGToDAGISel::selectVectorLoad(SDNode *N) {
   CurDAG->RemoveDeadNode(N);
 }
 
+// LDH* (chain, addr, policy) / STH (chain, addr, policy, words...) ->
+// LDG/STG/LD/ST desc[policy][addr], the policy in a uniform register pair
+// (Hopper; Blackwell keeps the default descriptor). 1/2-byte loads
+// zero-extend; 8/16-byte accesses use register tuples of the 32-bit words.
+void SASSDAGToDAGISel::selectPolicyAccess(SDNode *N) {
+  SDLoc DL(N);
+  auto *M = cast<MemSDNode>(N);
+  bool Load = N->getOpcode() != SASSISD::STH;
+  unsigned Bytes = M->getMemoryVT().getStoreSize();
+  unsigned Size = Bytes == 1 ? 0 : Bytes == 2 ? 1 : Bytes == 4 ? 2 : Bytes == 8 ? 3 : 4;
+  bool Desc = !Subtarget->hasBlackwellISA();
+  bool Global = M->getAddressSpace() == 1;
+  bool NC = Load && isNonCoherent(M);
+  // [desc][global][size]
+  static const unsigned Loads[2][2][5] = {
+      {{SASS::LDU8, SASS::LDU16, SASS::LD32, SASS::LD64, SASS::LD128},
+       {SASS::LDGU8, SASS::LDGU16, SASS::LDG32, SASS::LDG64, SASS::LDG128}},
+      {{SASS::LDU8_D, SASS::LDU16_D, SASS::LD32_D, SASS::LD64_D, SASS::LD128_D},
+       {SASS::LDGU8_D, SASS::LDGU16_D, SASS::LDG32_D, SASS::LDG64_D, SASS::LDG128_D}}};
+  static const unsigned LoadsNC[2][5] = {
+      {SASS::LDGU8_NC, SASS::LDGU16_NC, SASS::LDG32_NC, SASS::LDG64_NC, SASS::LDG128_NC},
+      {SASS::LDGU8_D_NC, SASS::LDGU16_D_NC, SASS::LDG32_D_NC, SASS::LDG64_D_NC,
+       SASS::LDG128_D_NC}};
+  static const unsigned Stores[2][2][5] = {
+      {{SASS::STU8, SASS::STU16, SASS::ST32, SASS::ST64, SASS::ST128},
+       {SASS::STGU8, SASS::STGU16, SASS::STG32, SASS::STG64, SASS::STG128}},
+      {{SASS::STU8_D, SASS::STU16_D, SASS::ST32_D, SASS::ST64_D, SASS::ST128_D},
+       {SASS::STGU8_D, SASS::STGU16_D, SASS::STG32_D, SASS::STG64_D, SASS::STG128_D}}};
+  unsigned Opc = Load ? (NC ? LoadsNC[Desc][Size] : Loads[Desc][Global][Size])
+                      : Stores[Desc][Global][Size];
+  SmallVector<SDValue, 8> Ops;
+  if (Desc)
+    Ops.push_back(SASS::policyDesc(*CurDAG, N->getOperand(2), DL));
+  SDValue Base, Off;
+  SelectADDRri(N->getOperand(1), Base, Off);
+  Ops.append({Base, Off});
+  unsigned Words = std::max(1u, Bytes / 4);
+  if (!Load) {
+    if (Words == 1) {
+      Ops.push_back(N->getOperand(3));
+    } else {
+      SmallVector<SDValue, 4> Vals(N->op_begin() + 3, N->op_begin() + 3 + Words);
+      Ops.push_back(tuple(DL, Vals));
+    }
+  }
+  Ops.append({guard(DL), CurDAG->getTargetConstant(0, DL, MVT::i32), N->getOperand(0)});
+  MachineSDNode *MI;
+  if (!Load) {
+    MI = CurDAG->getMachineNode(Opc, DL, MVT::Other, Ops);
+  } else {
+    MI = CurDAG->getMachineNode(Opc, DL, Words == 1 ? MVT::i32 : MVT::Untyped, MVT::Other,
+                                Ops);
+    for (unsigned I = 0; I < Words; ++I)
+      ReplaceUses(SDValue(N, I),
+                  Words == 1 ? SDValue(MI, 0)
+                             : CurDAG->getTargetExtractSubreg(SubIdx[I], DL, MVT::i32,
+                                                              SDValue(MI, 0)));
+    ReplaceUses(SDValue(N, Words), SDValue(MI, 1));
+  }
+  CurDAG->setNodeMemRefs(MI, {M->getMemOperand()});
+  if (Load)
+    CurDAG->RemoveDeadNode(N);
+  else
+    ReplaceNode(N, MI);
+}
+
 // STV2/STV4 (chain, v0..vN-1, addr) -> REG_SEQUENCE + one wide store.
 void SASSDAGToDAGISel::selectVectorStore(SDNode *N) {
   SDLoc DL(N);
   auto *M = cast<MemSDNode>(N);
   bool Four = N->getOpcode() == SASSISD::STV4;
   unsigned NumElts = Four ? 4 : 2;
+  if (M->getAddressSpace() == 3 && !Subtarget->hasBlackwellISA() &&
+      all_of(seq(1u, NumElts + 1), [&](unsigned I) { return isNullConstant(N->getOperand(I)); })) {
+    SDValue Base, Off;
+    SelectADDRs(N->getOperand(1 + NumElts), Base, Off);
+    SDValue Ops[] = {Base, Off, guard(DL), CurDAG->getTargetConstant(0, DL, MVT::i32),
+                     N->getOperand(0)};
+    MachineSDNode *St = CurDAG->getMachineNode(Four ? SASS::STS128Z : SASS::STS64Z, DL,
+                                               MVT::Other, Ops);
+    CurDAG->setNodeMemRefs(St, {M->getMemOperand()});
+    ReplaceNode(N, St);
+    return;
+  }
   SmallVector<SDValue, 9> Seq = {CurDAG->getTargetConstant(
       Four ? SASS::GPR128RegClassID : SASS::GPR64RegClassID, DL, MVT::i32)};
   for (unsigned I = 0; I < NumElts; ++I) {

@@ -49,6 +49,7 @@ public:
                    const DebugLoc &DL, Register DestReg, Register SrcReg,
                    bool KillSrc, bool RenamableDest = false,
                    bool RenamableSrc = false) const override;
+  bool expandPostRAPseudo(MachineInstr &MI) const override;
 
   bool analyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
                      MachineBasicBlock *&FBB,
@@ -85,6 +86,14 @@ public:
     return 16;
   }
   bool isHighLatencyDef(int Opc) const override;
+  bool shouldSink(const MachineInstr &MI) const override;
+  bool shouldPostRASink(const MachineInstr &MI) const override;
+  bool isAsCheapAsAMove(const MachineInstr &MI) const override;
+  static bool isCheapALU(const MachineInstr &MI);
+  bool rematALU(const MachineInstr &MI) const;
+
+protected:
+  bool isReMaterializableImpl(const MachineInstr &MI) const override;
 };
 
 } // namespace llvm

@@ -33,6 +33,12 @@ inline bool takesFTZ(const MCInstrDesc &D) { return (D.TSFlags >> 12) & 1; }
 inline bool notPredicable(const MCInstrDesc &D) { return (D.TSFlags >> 13) & 1; }
 /// MCInst flag: print the .FTZ modifier (SASSInstPrinter::printInst).
 constexpr unsigned InstFlagFTZ = 1;
+/// MCInst flags: a global load's cache hints from PTX `ld`, printed after
+/// LDG.E: .NA (L1::no_allocate) and the L2 sector prefetch
+/// .LTC64B/.LTC128B/.LTC256B (L2::64B/128B/256B, field value 1-3).
+constexpr unsigned InstFlagNA = 2;
+constexpr unsigned InstFlagLTCShift = 2;
+constexpr unsigned InstFlagLTCMask = 3u << InstFlagLTCShift;
 
 /// ISETP condition: [2:0] LT LE GT GE EQ NE, bit 3 unsigned.
 inline const char *intCondStr(unsigned CC) {

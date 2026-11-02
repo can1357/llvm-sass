@@ -12,6 +12,10 @@
 //   emits: elect one pending thread, move its operands into uniform
 //   registers, issue the instruction, repeat while any thread is pending
 //   (BRA.U.ANY keeps the warp together).
+// * L2 cache policies (.L2::cache_hint) become the descriptor pair of the
+//   instruction (desc[URa]): UMOVs of a constant policy or R2URs of a
+//   computed one. ld/st with a policy arrive as SASS::L2HintLoadFn/
+//   L2HintStoreFn calls, lowered to SASSISD::LDH*/STH memory nodes.
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,6 +25,7 @@
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SelectionDAG.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -104,6 +109,62 @@ bool SASSTargetLowering::replacePTXResults(SDNode *N, SmallVectorImpl<SDValue> &
   return true;
 }
 
+SDValue SASSTargetLowering::lowerL2HintCall(CallLoweringInfo &CLI,
+                                            SmallVectorImpl<SDValue> &InVals) const {
+  auto *G = dyn_cast<GlobalAddressSDNode>(CLI.Callee);
+  if (!G || !CLI.CB)
+    return SDValue();
+  StringRef Name = G->getGlobal()->getName();
+  bool Load = Name.starts_with(SASS::L2HintLoadFn);
+  if (!Load && !Name.starts_with(SASS::L2HintStoreFn))
+    return SDValue();
+  // <prefix>.<bytes>.p<addrspace>
+  unsigned Bytes;
+  if (Name.split('.').second.split('.').first.getAsInteger(10, Bytes))
+    report_fatal_error("SASS: bad L2 cache-hint builtin " + Name);
+  CLI.IsTailCall = false; // A memory access: the kernel still returns.
+  SelectionDAG &DAG = CLI.DAG;
+  MachineFunction &MF = DAG.getMachineFunction();
+  const Value *Ptr = CLI.CB->getArgOperand(0);
+  MachineMemOperand::Flags F = Load ? MachineMemOperand::MOLoad : MachineMemOperand::MOStore;
+  if (Load) {
+    uint64_t Flags = cast<ConstantSDNode>(CLI.OutVals[2])->getZExtValue();
+    if (Flags & 1)
+      F |= MachineMemOperand::MOInvariant;
+    F |= SASS::loadHintToMMOFlags(Flags);
+  }
+  MachineMemOperand *MMO = MF.getMachineMemOperand(MachinePointerInfo(Ptr), F,
+                                                    LocationSize::precise(Bytes), Align(Bytes));
+  EVT MemVT = EVT::getIntegerVT(*DAG.getContext(), Bytes * 8);
+  unsigned Words = std::max(1u, Bytes / 4);
+  SDValue Addr = CLI.OutVals[0], Pol = CLI.OutVals[1];
+  if (Load) {
+    unsigned Opc = Words == 4 ? SASSISD::LDH4 : Words == 2 ? SASSISD::LDH2 : SASSISD::LDH1;
+    SmallVector<EVT, 5> VTs(Words, MVT::i32);
+    VTs.push_back(MVT::Other);
+    SDValue Ld = DAG.getMemIntrinsicNode(Opc, CLI.DL, DAG.getVTList(VTs),
+                                         {CLI.Chain, Addr, Pol}, MemVT, MMO);
+    for (unsigned I = 0; I < Words; ++I)
+      InVals.push_back(Ld.getValue(I));
+    return Ld.getValue(Words);
+  }
+  SmallVector<SDValue, 7> Ops = {CLI.Chain, Addr, Pol};
+  Ops.append(CLI.OutVals.begin() + 2, CLI.OutVals.end());
+  // sm_90: STG.U8/.U16 store only the low bits of their word; its zero
+  // extension (an LOP3 after the F2FP of a bf16 store) is dropped.
+  if (Bytes < 4 && !DAG.getSubtarget<SASSSubtarget>().hasBlackwellISA()) {
+    SDValue &V = Ops[3];
+    auto *M = V.getOpcode() == ISD::AND ? dyn_cast<ConstantSDNode>(V.getOperand(1))
+                                        : nullptr;
+    if (V.getOpcode() == ISD::ZERO_EXTEND)
+      V = DAG.getNode(ISD::ANY_EXTEND, CLI.DL, MVT::i32, V.getOperand(0));
+    else if (M && M->getAPIntValue().countr_one() >= Bytes * 8)
+      V = V.getOperand(0);
+  }
+  return DAG.getMemIntrinsicNode(SASSISD::STH, CLI.DL, DAG.getVTList(MVT::Other), Ops, MemVT,
+                                 MMO);
+}
+
 //===----------------------------------------------------------------------===//
 // Selection
 //===----------------------------------------------------------------------===//
@@ -129,6 +190,18 @@ private:
   /// Intrinsic argument \p I.
   SDValue arg(unsigned I) const {
     return N->getOperand(I + (N->getOpcode() == ISD::INTRINSIC_WO_CHAIN ? 1 : 2));
+  }
+  /// \p Uni if every operand in \p Ops is warp-uniform (Hopper; SDNode
+  /// divergence from SASSTargetLowering::isSDNodeSourceOfDivergence), else
+  /// \p Any (a waterfall loop over the distinct values).
+  unsigned uniformOr(unsigned Uni, unsigned Any, ArrayRef<SDValue> Ops) const {
+    if (DAG.getSubtarget<SASSSubtarget>().hasBlackwellISA() ||
+        !DAG.getUniformityInfo())
+      return Any;
+    for (SDValue V : Ops)
+      if (V->isDivergent())
+        return Any;
+    return Uni;
   }
   SDValue imm(int64_t V) { return DAG.getTargetConstant(V, DL, MVT::i32); }
   SDValue rz() { return DAG.getRegister(SASS::RZ, MVT::i32); }
@@ -190,6 +263,15 @@ private:
     for (unsigned Opc : {SASS::MEMBAR_ALL_CTA, SASS::MEMBAR_ALL_GPU, SASS::ERRBAR, SASS::CGAERRBAR})
       emit(Opc, {}, {});
   }
+  /// The L2 cache policy of a bulk or tensor copy whose cache-hint flag
+  /// (argument \p FlagArg) is set, as a uniform register pair; null without
+  /// one. Blackwell copies keep the default policy.
+  SDValue policy(unsigned PolArg, unsigned FlagArg) {
+    if (!cast<ConstantSDNode>(arg(FlagArg))->getZExtValue() ||
+        DAG.getSubtarget<SASSSubtarget>().hasBlackwellISA())
+      return SDValue();
+    return SASS::policyDesc(DAG, arg(PolArg), DL);
+  }
   /// Bulk copy sizes are given in 16-byte units.
   SDValue units16(SDValue Size) {
     if (auto *C = dyn_cast<ConstantSDNode>(Size))
@@ -217,7 +299,9 @@ bool PTXSelector::mbarrier(unsigned ID) {
       Lo = node(SASS::SHLri, MVT::i32, {V, imm(1)});
       Hi = node(SASS::SHLri, MVT::i32, {V, imm(11)});
     }
-    emit(SASS::UNI_SYNCS_EXCH, {}, {reg32(arg(0)), Lo, Hi});
+    SDValue A = reg32(arg(0));
+    emit(uniformOr(SASS::UNIU_SYNCS_EXCH, SASS::UNI_SYNCS_EXCH, {A, Lo, Hi}), {},
+         {A, Lo, Hi});
     done();
     return true;
   }
@@ -326,14 +410,17 @@ bool PTXSelector::mbarrier(unsigned ID) {
     done({P});
     return true;
   }
-  case Intrinsic::nvvm_cp_async_mbarrier_arrive_noinc_shared:
-    emit(SASS::UNI_ARRIVES_ARVCNT, {}, {reg32(arg(0))});
+  case Intrinsic::nvvm_cp_async_mbarrier_arrive_noinc_shared: {
+    SDValue A = reg32(arg(0));
+    emit(uniformOr(SASS::UNIU_ARRIVES_ARVCNT, SASS::UNI_ARRIVES_ARVCNT, {A}), {}, {A});
     done();
     return true;
+  }
   case Intrinsic::nvvm_cp_async_mbarrier_arrive_shared: {
     auto [A, O] = shared(arg(0));
     emit(SASS::SYNCS_EXPECT_ONE, {}, {A, O});
-    emit(SASS::UNI_ARRIVES_TRANSCNT, {}, {reg32(arg(0))});
+    SDValue B = reg32(arg(0));
+    emit(uniformOr(SASS::UNIU_ARRIVES_TRANSCNT, SASS::UNI_ARRIVES_TRANSCNT, {B}), {}, {B});
     done();
     return true;
   }
@@ -364,20 +451,27 @@ bool PTXSelector::tensor(unsigned ID) {
   const T *E = find_if(Table, [&](const T &E) { return E.IID == ID; });
   if (E == std::end(Table))
     return false;
-  SmallVector<SDValue, 10> Ops = {imm(E->Dim)};
+  SmallVector<SDValue, 11> Ops = {imm(E->Dim)};
   unsigned C0;
+  SDValue Pol;
   if (E->Load) {
     if (cast<ConstantSDNode>(arg(3 + E->Dim + 2))->getZExtValue())
       report_fatal_error("SASS: multicast tensor copies are not supported");
     Ops.append({arg(2), reg32(arg(0)), reg32(arg(1))});
     C0 = 3;
+    Pol = policy(3 + E->Dim + 1, 3 + E->Dim + 3);
   } else {
     Ops.append({arg(1), reg32(arg(0))});
     C0 = 2;
+    Pol = policy(2 + E->Dim, 2 + E->Dim + 1);
   }
   for (unsigned I = 0; I < 5; ++I)
     Ops.push_back(I < E->Dim ? reg32(arg(C0 + I)) : rz());
-  emit(E->Load ? SASS::UNI_UTMALDG : SASS::UNI_UTMASTG, {}, Ops);
+  if (Pol)
+    Ops.push_back(Pol);
+  emit(E->Load ? (Pol ? SASS::UNI_UTMALDG_H : SASS::UNI_UTMALDG)
+               : (Pol ? SASS::UNI_UTMASTG_H : SASS::UNI_UTMASTG),
+       {}, Ops);
   done();
   return true;
 }
@@ -405,19 +499,39 @@ bool PTXSelector::select() {
     // ptxas emits nothing: SYNCS.EXCH completes before later barrier use.
     break;
   case Intrinsic::nvvm_cp_async_bulk_global_to_shared_cluster:
-    if (cast<ConstantSDNode>(arg(6))->getZExtValue())
+  case Intrinsic::nvvm_cp_async_bulk_global_to_shared_cta: {
+    // cluster: dst, mbar, src, size, cta_mask, hint, flag_mask, flag_hint;
+    // cta: dst, mbar, src, size, hint, flag_hint.
+    bool Cluster = ID == Intrinsic::nvvm_cp_async_bulk_global_to_shared_cluster;
+    if (Cluster && cast<ConstantSDNode>(arg(6))->getZExtValue())
       report_fatal_error("SASS: multicast bulk copies are not supported");
-    emit(SASS::UNI_UBLKCP_SG, {}, {reg32(arg(0)), reg32(arg(1)), arg(2), units16(arg(3))});
+    SDValue Pol = Cluster ? policy(5, 7) : policy(4, 5);
+    SmallVector<SDValue, 5> Ops = {reg32(arg(0)), reg32(arg(1)), arg(2), units16(arg(3))};
+    unsigned Opc = Pol ? uniformOr(SASS::UNIU_UBLKCP_SG_H, SASS::UNI_UBLKCP_SG_H, Ops)
+                       : uniformOr(SASS::UNIU_UBLKCP_SG, SASS::UNI_UBLKCP_SG, Ops);
+    if (Pol)
+      Ops.push_back(Pol);
+    emit(Opc, {}, Ops);
     break;
-  case Intrinsic::nvvm_cp_async_bulk_global_to_shared_cta:
-    emit(SASS::UNI_UBLKCP_SG, {}, {reg32(arg(0)), reg32(arg(1)), arg(2), units16(arg(3))});
+  }
+  case Intrinsic::nvvm_cp_async_bulk_shared_cta_to_global: {
+    // dst, src, size, hint, flag_hint
+    SDValue Pol = policy(3, 4);
+    SmallVector<SDValue, 4> Ops = {arg(0), reg32(arg(1)), units16(arg(2))};
+    if (Pol)
+      Ops.push_back(Pol);
+    emit(Pol ? SASS::UNI_UBLKCP_GS_H : SASS::UNI_UBLKCP_GS, {}, Ops);
     break;
-  case Intrinsic::nvvm_cp_async_bulk_shared_cta_to_global:
-    emit(SASS::UNI_UBLKCP_GS, {}, {arg(0), reg32(arg(1)), units16(arg(2))});
+  }
+  case Intrinsic::nvvm_cp_async_bulk_prefetch_L2: {
+    // src, size, hint, flag_hint
+    SDValue Pol = policy(2, 3);
+    SmallVector<SDValue, 3> Ops = {arg(0), units16(arg(1))};
+    if (Pol)
+      Ops.push_back(Pol);
+    emit(Pol ? SASS::UNI_UBLKPF_L2_H : SASS::UNI_UBLKPF_L2, {}, Ops);
     break;
-  case Intrinsic::nvvm_cp_async_bulk_prefetch_L2:
-    emit(SASS::UNI_UBLKPF_L2, {}, {arg(0), units16(arg(1))});
-    break;
+  }
   case Intrinsic::nvvm_cp_async_bulk_commit_group:
     emit(SASS::UTMACMDFLUSH, {}, {});
     break;
@@ -482,12 +596,137 @@ bool SASS::selectPTXIntrinsic(SelectionDAG &DAG, SDNode *N) {
   return PTXSelector(DAG, N).select();
 }
 
+SDValue SASS::policyDesc(SelectionDAG &DAG, SDValue Pol, const SDLoc &DL) {
+  // A constant policy is two UMOVs (ptxas: UMOV UR12, 0x0; UMOV UR13,
+  // 0x12f00000), any other value the R2URs of its halves.
+  SDValue Guard[] = {DAG.getRegister(SASS::PT, MVT::i1), DAG.getTargetConstant(0, DL, MVT::i32)};
+  auto Half = [&](unsigned Sub) -> SDValue {
+    if (auto *C = dyn_cast<ConstantSDNode>(Pol)) {
+      uint32_t V = C->getZExtValue() >> (Sub == SASS::sub1 ? 32 : 0);
+      SDValue Ops[] = {DAG.getTargetConstant(int32_t(V), DL, MVT::i32), Guard[0], Guard[1]};
+      return SDValue(DAG.getMachineNode(SASS::UMOVi, DL, MVT::i32, Ops), 0);
+    }
+    SDValue Ops[] = {DAG.getTargetExtractSubreg(Sub, DL, MVT::i32, Pol), Guard[0], Guard[1]};
+    return SDValue(DAG.getMachineNode(SASS::R2UR, DL, MVT::i32, Ops), 0);
+  };
+  SDValue Ops[] = {DAG.getTargetConstant(SASS::UGPR64RegClassID, DL, MVT::i32), Half(SASS::sub0),
+                   DAG.getTargetConstant(SASS::sub0, DL, MVT::i32), Half(SASS::sub1),
+                   DAG.getTargetConstant(SASS::sub1, DL, MVT::i32)};
+  return SDValue(DAG.getMachineNode(TargetOpcode::REG_SEQUENCE, DL, MVT::i64, Ops), 0);
+}
+
 //===----------------------------------------------------------------------===//
 // Uniform-operand loops
 //===----------------------------------------------------------------------===//
 
+/// UNIU_SYNCS_EXCH: the operands are warp-uniform and an mbarrier.init by
+/// every active thread is one init, so it is issued once with any thread's
+/// values. Back-to-back inits share one FENCE.VIEW.ASYNC.S and wait for their
+/// completions together, as ptxas's barrier setup does.
+static MachineBasicBlock *expandUniformOperands(MachineInstr &MI, MachineBasicBlock *BB) {
+  MachineFunction &MF = *BB->getParent();
+  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  MachineBasicBlock::iterator At = MI.getIterator();
+  auto Build = [&](unsigned O, Register Def = Register()) {
+    MachineInstrBuilder MIB = BuildMI(*BB, At, DL, TII.get(O));
+    if (Def)
+      MIB.addDef(Def);
+    return MIB;
+  };
+  auto ToUR = [&](const MachineOperand &MO, unsigned Sub = 0) {
+    Register U = MRI.createVirtualRegister(&SASS::UGPR32RegClass);
+    Build(SASS::R2UR_G, U).addReg(MO.getReg(), {}, Sub).addReg(SASS::PT).addImm(0);
+    return U;
+  };
+  auto Pair = [&](Register Lo, Register Hi) {
+    Register U = MRI.createVirtualRegister(&SASS::UGPR64RegClass);
+    Build(TargetOpcode::REG_SEQUENCE, U).addReg(Lo).addImm(SASS::sub0).addReg(Hi).addImm(SASS::sub1);
+    return U;
+  };
+  // A previous init with only register arithmetic and completion waits
+  // after it already fenced: reuse its fence, and move those waits after
+  // this init so the inits complete in parallel.
+  Register Fence;
+  SmallVector<MachineInstr *, 8> Waits;
+  for (MachineBasicBlock::iterator I = At; I != BB->begin();) {
+    MachineInstr &P = *--I;
+    if (P.getOpcode() == SASS::SBWAIT) {
+      Waits.push_back(&P);
+      continue;
+    }
+    if (P.getOpcode() == SASS::SYNCS_EXCH)
+      Fence = P.getOperand(3).getReg();
+    if (Fence || P.hasUnmodeledSideEffects() || P.mayLoadOrStore() || P.isCall())
+      break;
+  }
+  if (!Fence)
+    Waits.clear();
+  Register A = ToUR(MI.getOperand(0));
+  Register V = Pair(ToUR(MI.getOperand(1)), ToUR(MI.getOperand(2)));
+  if (!Fence) {
+    Fence = MRI.createVirtualRegister(&SASS::GPR32RegClass);
+    Build(SASS::FENCE_VIEW_ASYNC_S, Fence).addReg(SASS::PT).addImm(0);
+  }
+  Register Done = MRI.createVirtualRegister(&SASS::GPR32RegClass);
+  Build(SASS::SYNCS_EXCH, Done).addReg(A).addReg(V).addReg(Fence).addReg(SASS::PT).addImm(0);
+  for (MachineInstr *W : reverse(Waits))
+    BB->splice(MI.getIterator(), BB, W);
+  // mbarrier.init completes before the barrier is used.
+  BuildMI(*BB, MI.getIterator(), DL, TII.get(SASS::SBWAIT)).addReg(Done).addReg(SASS::PT).addImm(0);
+  MI.eraseFromParent();
+  return BB;
+}
+
+/// UNIU_ARRIVES_*: ARRIVES arrives once for every active thread on the
+/// barrier at its uniform address; with a warp-uniform address that is one
+/// ARRIVES by all of them (ptxas's form), no loop over the distinct values.
+static MachineBasicBlock *expandUniformArrive(MachineInstr &MI, MachineBasicBlock *BB) {
+  MachineFunction &MF = *BB->getParent();
+  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  DebugLoc DL = MI.getDebugLoc();
+  Register A = MRI.createVirtualRegister(&SASS::UGPR32RegClass);
+  BuildMI(*BB, MI, DL, TII.get(SASS::R2UR_G), A)
+      .addReg(MI.getOperand(0).getReg())
+      .addReg(SASS::PT)
+      .addImm(0);
+  BuildMI(*BB, MI, DL,
+          TII.get(MI.getOpcode() == SASS::UNIU_ARRIVES_ARVCNT ? SASS::ARRIVES_ARVCNT
+                                                               : SASS::ARRIVES_TRANSCNT))
+      .addReg(A)
+      .addReg(SASS::PT)
+      .addImm(0);
+  MI.eraseFromParent();
+  return BB;
+}
+
 MachineBasicBlock *SASS::expandPTXUniform(MachineInstr &MI, MachineBasicBlock *BB) {
   unsigned Opc = MI.getOpcode();
+  if (Opc == SASS::UNIU_SYNCS_EXCH)
+    return expandUniformOperands(MI, BB);
+  if (Opc == SASS::UNIU_ARRIVES_ARVCNT || Opc == SASS::UNIU_ARRIVES_TRANSCNT)
+    return expandUniformArrive(MI, BB);
+  // _H forms carry an L2 cache policy, already in a uniform register pair,
+  // before the guard operands.
+  Register Pol;
+  switch (Opc) {
+  case SASS::UNIU_UBLKCP_SG_H: Opc = SASS::UNIU_UBLKCP_SG; break;
+  case SASS::UNI_UBLKCP_SG_H: Opc = SASS::UNI_UBLKCP_SG; break;
+  case SASS::UNI_UBLKCP_GS_H: Opc = SASS::UNI_UBLKCP_GS; break;
+  case SASS::UNI_UBLKPF_L2_H: Opc = SASS::UNI_UBLKPF_L2; break;
+  case SASS::UNI_UTMALDG_H: Opc = SASS::UNI_UTMALDG; break;
+  case SASS::UNI_UTMASTG_H: Opc = SASS::UNI_UTMASTG; break;
+  default: break;
+  }
+  if (Opc != MI.getOpcode())
+    Pol = MI.getOperand(MI.getDesc().getNumOperands() - 3).getReg();
+  // A bulk copy is issued once per active thread even with uniform operands:
+  // then only their moves to uniform registers leave the loop.
+  bool Hoist = Opc == SASS::UNIU_UBLKCP_SG;
+  if (Hoist)
+    Opc = SASS::UNI_UBLKCP_SG;
   switch (Opc) {
   case SASS::UNI_SYNCS_EXCH:
   case SASS::UNI_ARRIVES_ARVCNT:
@@ -550,17 +789,18 @@ MachineBasicBlock *SASS::expandPTXUniform(MachineInstr &MI, MachineBasicBlock *B
     Guard(M);
   }
   // The leader's value of a 32-bit GPR operand (or a 64-bit pair's half).
+  MachineBasicBlock &OpB = Hoist ? *BB : *Loop;
   auto ToUR = [&](const MachineOperand &MO, unsigned Sub = 0, Register Into = Register()) {
     Register U = Into ? Into : NewReg(&SASS::UGPR32RegClass);
-    MachineInstrBuilder M = Build(*Loop, SASS::R2UR_G, U);
+    MachineInstrBuilder M = Build(OpB, SASS::R2UR_G, U);
     M.addReg(MO.getReg(), {}, Sub);
-    Guard(M, Lead);
+    Guard(M, Hoist ? Register(SASS::PT) : Lead);
     return U;
   };
   auto ToUR64 = [&](const MachineOperand &MO) {
     Register Lo = ToUR(MO, SASS::sub0), Hi = ToUR(MO, SASS::sub1);
     Register U = NewReg(&SASS::UGPR64RegClass);
-    BuildMI(Loop, DL, TII.get(TargetOpcode::REG_SEQUENCE), U)
+    BuildMI(&OpB, DL, TII.get(TargetOpcode::REG_SEQUENCE), U)
         .addReg(Lo)
         .addImm(SASS::sub0)
         .addReg(Hi)
@@ -569,7 +809,7 @@ MachineBasicBlock *SASS::expandPTXUniform(MachineInstr &MI, MachineBasicBlock *B
   };
   auto Pair = [&](Register Lo, Register Hi) {
     Register U = NewReg(&SASS::UGPR64RegClass);
-    BuildMI(Loop, DL, TII.get(TargetOpcode::REG_SEQUENCE), U)
+    BuildMI(&OpB, DL, TII.get(TargetOpcode::REG_SEQUENCE), U)
         .addReg(Lo)
         .addImm(SASS::sub0)
         .addReg(Hi)
@@ -642,23 +882,29 @@ MachineBasicBlock *SASS::expandPTXUniform(MachineInstr &MI, MachineBasicBlock *B
     Register DM = Pair(ToUR(MI.getOperand(0)), ToUR(MI.getOperand(1)));
     Register Src = ToUR64(MI.getOperand(2));
     Register Cnt = ToUR(MI.getOperand(3));
-    MachineInstrBuilder M = Build(*Loop, SASS::UBLKCP_SG);
+    MachineInstrBuilder M = Build(*Loop, Pol ? SASS::UBLKCP_SG_D : SASS::UBLKCP_SG);
     M.addReg(DM).addReg(Src).addReg(Cnt);
+    if (Pol)
+      M.addReg(Pol);
     Guard(M);
     break;
   }
   case SASS::UNI_UBLKCP_GS: {
     Register Dst = ToUR64(MI.getOperand(0));
     Register Src = ToUR(MI.getOperand(1)), Cnt = ToUR(MI.getOperand(2));
-    MachineInstrBuilder M = Build(*Loop, SASS::UBLKCP_GS);
+    MachineInstrBuilder M = Build(*Loop, Pol ? SASS::UBLKCP_GS_D : SASS::UBLKCP_GS);
     M.addReg(Dst).addReg(Src).addReg(Cnt);
+    if (Pol)
+      M.addReg(Pol);
     Guard(M);
     break;
   }
   case SASS::UNI_UBLKPF_L2: {
     Register Src = ToUR64(MI.getOperand(0)), Cnt = ToUR(MI.getOperand(1));
-    MachineInstrBuilder M = Build(*Loop, SASS::UBLKPF_L2);
+    MachineInstrBuilder M = Build(*Loop, Pol ? SASS::UBLKPF_L2_D : SASS::UBLKPF_L2);
     M.addReg(Src).addReg(Cnt);
+    if (Pol)
+      M.addReg(Pol);
     Guard(M);
     break;
   }
@@ -695,16 +941,21 @@ MachineBasicBlock *SASS::expandPTXUniform(MachineInstr &MI, MachineBasicBlock *B
       }
       Group.push_back(Phys);
     }
-    unsigned Op = Load ? (Dim == 1 ? SASS::UTMALDG_1D : Dim == 2 ? SASS::UTMALDG_2D
-                          : Dim == 3 ? SASS::UTMALDG_3D : Dim == 4 ? SASS::UTMALDG_4D
-                                                                   : SASS::UTMALDG_5D)
-                       : (Dim == 1 ? SASS::UTMASTG_1D : Dim == 2 ? SASS::UTMASTG_2D
-                          : Dim == 3 ? SASS::UTMASTG_3D : Dim == 4 ? SASS::UTMASTG_4D
-                                                                   : SASS::UTMASTG_5D);
-    MachineInstrBuilder M = Build(*Loop, Op);
+    static const unsigned Ops[2][2][5] = {
+        {{SASS::UTMASTG_1D, SASS::UTMASTG_2D, SASS::UTMASTG_3D, SASS::UTMASTG_4D,
+          SASS::UTMASTG_5D},
+         {SASS::UTMASTG_1D_D, SASS::UTMASTG_2D_D, SASS::UTMASTG_3D_D, SASS::UTMASTG_4D_D,
+          SASS::UTMASTG_5D_D}},
+        {{SASS::UTMALDG_1D, SASS::UTMALDG_2D, SASS::UTMALDG_3D, SASS::UTMALDG_4D,
+          SASS::UTMALDG_5D},
+         {SASS::UTMALDG_1D_D, SASS::UTMALDG_2D_D, SASS::UTMALDG_3D_D, SASS::UTMALDG_4D_D,
+          SASS::UTMALDG_5D_D}}};
+    MachineInstrBuilder M = Build(*Loop, Ops[Load][bool(Pol)][Dim - 1]);
     for (Register R : Group)
       M.addReg(R, RegState::Kill);
     M.addReg(Map);
+    if (Pol)
+      M.addReg(Pol);
     Guard(M);
     break;
   }

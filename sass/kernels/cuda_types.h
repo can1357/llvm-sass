@@ -237,6 +237,10 @@ SASS_HALF_PACK(__nv_bfloat16, __nv_bfloat162, bfloat16)
     H r = __builtin_elementwise_fma(a, b, c);                                  \
     return r != r ? r : (r < (H)0 ? (H)0 : r);                                 \
   }                                                                            \
+  /* fma.rn.sat: the rounded result clamped to [0, 1], NaN -> +0 */            \
+  SASS_INL H __hfma_sat(H a, H b, H c) {                                       \
+    return __hmin(__hmax(__builtin_elementwise_fma(a, b, c), (H)0), (H)1);     \
+  }                                                                            \
   SASS_INL bool __heq(H a, H b) { return a == b; }                             \
   SASS_INL bool __hne(H a, H b) { return a != b && a == a && b == b; }         \
   SASS_INL bool __hlt(H a, H b) { return a < b; }                              \
@@ -278,6 +282,9 @@ template <typename H2, typename H> SASS_INL H2 __sass_mask2(bool lo, bool hi) {
   SASS_INL H2 __h2div(H2 a, H2 b) { return H2{__hdiv(a.x, b.x), __hdiv(a.y, b.y)}; } \
   SASS_INL H2 __hfma2_relu(H2 a, H2 b, H2 c) {                                 \
     return H2{__hfma_relu(a.x, b.x, c.x), __hfma_relu(a.y, b.y, c.y)};         \
+  }                                                                            \
+  SASS_INL H2 __hfma2_sat(H2 a, H2 b, H2 c) {                                  \
+    return __hmin2(__hmax2(__builtin_elementwise_fma(a, b, c), H2{0, 0}), H2{1, 1}); \
   }                                                                            \
   SASS_INL H2 __heq2(H2 a, H2 b) { return __sass_mask2<H2, H>(a.x == b.x, a.y == b.y); } \
   SASS_INL H2 __hne2(H2 a, H2 b) { return __sass_mask2<H2, H>(__hne(a.x, b.x), __hne(a.y, b.y)); } \
@@ -519,6 +526,20 @@ SASS_INL __half atomicAdd(__half *p, __half v) {
 }
 SASS_INL __nv_bfloat16 atomicAdd(__nv_bfloat16 *p, __nv_bfloat16 v) {
   return __scoped_atomic_fetch_add(p, v, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+}
+// sm_90 vector adds, atomic per element (ATOMG/REDG .F32x2/.F32x4, as nvcc).
+SASS_INL float2 atomicAdd(float2 *p, float2 v) {
+  float2 r;
+  asm volatile("atom.add.v2.f32 {%0,%1}, [%2], {%3,%4};"
+               : "=f"(r.x), "=f"(r.y) : "l"(p), "f"(v.x), "f"(v.y) : "memory");
+  return r;
+}
+SASS_INL float4 atomicAdd(float4 *p, float4 v) {
+  float4 r;
+  asm volatile("atom.add.v4.f32 {%0,%1,%2,%3}, [%4], {%5,%6,%7,%8};"
+               : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w)
+               : "l"(p), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w) : "memory");
+  return r;
 }
 
 // Fences: fence.sc.{cta,gpu,sys} (MEMBAR.SC + ERRBAR + L1 invalidation).

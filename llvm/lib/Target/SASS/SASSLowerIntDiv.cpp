@@ -25,6 +25,11 @@
 //
 // Narrower types are extended to 32 bits.
 //
+// sm_90: a divisor selected between two constants (`n / (c ? 256 : 512)`)
+// divides by each constant and selects the result, which costs two short
+// constant sequences instead of the variable one. Zero and, for signed
+// forms, -1 divisors are left alone (speculating them could trap).
+//
 //===----------------------------------------------------------------------===//
 
 #include "SASS.h"
@@ -82,14 +87,21 @@ class DivBuilder {
   }
   Value *select(Value *P, Value *T, Value *F) { return B.CreateSelect(P, T, F); }
 
-  /// Quotient estimate and remainder of \p N / \p D after the first
-  /// correction (32 bits).
-  std::pair<Value *, Value *> core32(Value *N, Value *D, bool SignedCvt) {
+  /// x ~ 2^32 / \p D from below after one Newton step (32 bits).
+  Value *recip32(Value *D, bool SignedCvt) {
     Value *F = intr(SignedCvt ? Intrinsic::nvvm_i2f_rp : Intrinsic::nvvm_ui2f_rp, D);
     Value *R = intr(Intrinsic::nvvm_rcp_approx_ftz_f, F);
     R = B.CreateBitCast(B.CreateAdd(B.CreateBitCast(R, I32), c32(0x0ffffffe)), F32);
     Value *X = intr(Intrinsic::nvvm_f2ui_rz_ftz, R);
-    X = newton32(X, B.CreateMul(B.CreateNeg(D), X));
+    return newton32(X, B.CreateMul(B.CreateNeg(D), X));
+  }
+
+  /// Quotient estimate and remainder of \p N / \p D after the first
+  /// correction (32 bits), with \p X from recip32 if already computed.
+  std::pair<Value *, Value *> core32(Value *N, Value *D, bool SignedCvt,
+                                     Value *X) {
+    if (!X)
+      X = recip32(D, SignedCvt);
     Value *Q = umulhi32(X, N);
     Value *Rem = B.CreateSub(N, B.CreateMul(Q, D));
     Value *P = B.CreateICmpUGE(Rem, D);
@@ -111,8 +123,10 @@ class DivBuilder {
     return {select(P, B.CreateAdd(Q, c64(1)), Q), select(P, B.CreateSub(Rem, D), Rem)};
   }
 
-  /// The division or remainder \p Op of \p N by \p D at width 32 or 64.
-  Value *divide(Instruction::BinaryOps Op, Value *N, Value *D) {
+  /// The division or remainder \p Op of \p N by \p D at width 32 or 64;
+  /// \p X: the divisor's recip32 (unsigned 32-bit forms) if already computed.
+  Value *divide(Instruction::BinaryOps Op, Value *N, Value *D,
+                Value *X = nullptr) {
     Type *T = N->getType();
     bool Is64 = T == I64;
     bool Signed = Op == Instruction::SDiv || Op == Instruction::SRem;
@@ -123,7 +137,7 @@ class DivBuilder {
       AN = B.CreateBinaryIntrinsic(Intrinsic::abs, N, B.getFalse());
       AD = B.CreateBinaryIntrinsic(Intrinsic::abs, D, B.getFalse());
     }
-    auto [Q, R] = Is64 ? core64(AN, AD) : core32(AN, AD, Signed);
+    auto [Q, R] = Is64 ? core64(AN, AD) : core32(AN, AD, Signed, X);
     Value *P = B.CreateICmpUGE(R, AD);
     Value *V = Rem ? select(P, B.CreateSub(R, AD), R) : select(P, B.CreateAdd(Q, One), Q);
     if (Signed) {
@@ -191,8 +205,13 @@ public:
       I.eraseFromParent();
       return;
     }
-    // 64 bits: high words of both zero -> the 32-bit unsigned sequence.
+    // 64 bits: high words of both zero -> the 32-bit unsigned sequence. Its
+    // reciprocal of the divisor is computed before the test (it cannot
+    // fault): the MUFU overlaps the test and branch, and further divisions
+    // by the same divisor reuse it (EarlyCSE), e.g. the start and end of a
+    // CTA's share `c * T / G`, `(c + 1) * T / G`.
     BasicBlock *Head = I.getParent();
+    Value *X = recip32(lo(D), false);
     Value *Small = B.CreateICmpEQ(B.CreateLShr(B.CreateOr(N, D), 32), c64(0));
     Instruction *Term = I.getNextNode();
     BasicBlock *Tail = Head->splitBasicBlock(Term, "div.join");
@@ -208,7 +227,7 @@ public:
     Instruction::BinaryOps UOp =
         Op == Instruction::SDiv || Op == Instruction::UDiv ? Instruction::UDiv
                                                             : Instruction::URem;
-    Value *VN = B.CreateZExt(divide(UOp, lo(N), lo(D)), I64);
+    Value *VN = B.CreateZExt(divide(UOp, lo(N), lo(D), X), I64);
     B.CreateBr(Tail);
 
     B.SetInsertPoint(Full);
@@ -230,7 +249,49 @@ char SASSLowerIntDiv::ID = 0;
 INITIALIZE_PASS(SASSLowerIntDiv, "sass-lower-int-div",
                 "SASS lower integer division", false, false)
 
+/// Replaces `n op (c ? k1 : k2)` for constants k1, k2 by
+/// `c ? n op k1 : n op k2`.
+static bool splitSelectDivisors(Function &F) {
+  if (!F.getFnAttribute("target-cpu").getValueAsString().starts_with("sm_90"))
+    return false;
+  SmallVector<BinaryOperator *, 4> Work;
+  for (Instruction &I : instructions(F)) {
+    auto *BO = dyn_cast<BinaryOperator>(&I);
+    if (!BO || !BO->isIntDivRem())
+      continue;
+    bool Signed = BO->getOpcode() == Instruction::SDiv ||
+                  BO->getOpcode() == Instruction::SRem;
+    auto Safe = [&](Value *V) {
+      auto *C = dyn_cast<ConstantInt>(V);
+      return C && !C->isZero() && !(Signed && C->isMinusOne());
+    };
+    auto *S = dyn_cast<SelectInst>(BO->getOperand(1));
+    if (S && Safe(S->getTrueValue()) && Safe(S->getFalseValue()))
+      Work.push_back(BO);
+  }
+  for (BinaryOperator *BO : Work) {
+    auto *S = cast<SelectInst>(BO->getOperand(1));
+    IRBuilder<> B(BO);
+    Value *N = BO->getOperand(0);
+    auto Op = [&](Value *K) {
+      auto *R = cast<BinaryOperator>(
+          B.CreateBinOp(BO->getOpcode(), N, K, BO->getName()));
+      R->setIsExact(BO->isExact());
+      return R;
+    };
+    Value *R = B.CreateSelect(S->getCondition(), Op(S->getTrueValue()),
+                              Op(S->getFalseValue()));
+    R->takeName(BO);
+    BO->replaceAllUsesWith(R);
+    BO->eraseFromParent();
+    if (S->use_empty())
+      S->eraseFromParent();
+  }
+  return !Work.empty();
+}
+
 bool SASSLowerIntDiv::runOnFunction(Function &F) {
+  bool Changed = splitSelectDivisors(F);
   SmallVector<BinaryOperator *, 8> Divs;
   for (Instruction &I : instructions(F)) {
     auto *BO = dyn_cast<BinaryOperator>(&I);
@@ -258,7 +319,7 @@ bool SASSLowerIntDiv::runOnFunction(Function &F) {
   }
   for (BinaryOperator *BO : Divs)
     DivBuilder(*BO).expand(*BO);
-  return !Divs.empty();
+  return Changed || !Divs.empty();
 }
 
 FunctionPass *llvm::createSASSLowerIntDivPass() { return new SASSLowerIntDiv(); }

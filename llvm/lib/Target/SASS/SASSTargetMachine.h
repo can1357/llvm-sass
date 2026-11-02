@@ -39,6 +39,8 @@ public:
   bool isNoopAddrSpaceCast(unsigned SrcAS, unsigned DestAS) const override {
     return SrcAS <= 1 && DestAS <= 1;
   }
+  /// Pointers loaded from a by-value kernel parameter point to global memory.
+  unsigned getAssumedAddrSpace(const Value *V) const override;
 };
 
 } // namespace llvm

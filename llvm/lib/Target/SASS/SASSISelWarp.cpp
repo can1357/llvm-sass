@@ -10,6 +10,7 @@
 
 #include "SASS.h"
 #include "SASSInstrInfo.h"
+#include "SASSSubtarget.h"
 #include "llvm/CodeGen/SelectionDAG.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
 
@@ -96,6 +97,17 @@ static const unsigned ShflOpc[2][4][4] = {
 
 bool WarpSelector::shfl(unsigned Mode, bool WithPred) {
   SDValue Mask = arg(0), Val = arg(1), Lane = arg(2), C = arg(3);
+  // sm_90: a full-warp shuffle whose results are all unused orders no memory
+  // and has no other effect; ptxas drops it, and with it the math feeding it
+  // (e.g. a lane-0 broadcast of a value only the other role of a
+  // warp-specialized kernel reads).
+  if (auto *K = dyn_cast<ConstantSDNode>(Mask);
+      K && K->getZExtValue() == 0xffffffffu &&
+      !DAG.getSubtarget<SASSSubtarget>().hasBlackwellISA() &&
+      !N->hasAnyUseOfValue(0) && !(WithPred && N->hasAnyUseOfValue(1))) {
+    done({});
+    return true;
+  }
   sync(Mask);
   unsigned Form = 0;
   SDValue L = Lane, Cw = C;

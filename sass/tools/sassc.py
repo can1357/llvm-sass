@@ -63,6 +63,125 @@ ARCHES = {"sm90": ("sm_90", "sm_90"), "sm120": ("sm_120", "sm_120"),
           "sm121": ("sm_120", "sm_121")}
 
 
+# Occupancy retry (sm_90). Under a launch-bounds count the allocator uses
+# registers freely up to it and rematerializes nothing (values hoisted to
+# the kernel entry each keep a register), so a kernel can land just above an
+# occupancy step that it fits under: attention decode1 took 196 registers
+# (2 CTAs/SM) where 168 (3 CTAs/SM) compiles without spills. Each such kernel
+# is compiled again capped at the next step ("nvvm.maxnreg", which
+# SASS::maxRegCount honors) and the capped code is kept only if it spills
+# no more than the original; failing that, again with the pre-RA scheduler
+# keeping more registers free under the cap (its schedule, not the
+# allocator, is then what overflows). Kernels with setmaxnreg are left
+# alone: their regions' counts are split from the launch count. A kernel
+# whose launch bounds ask for a minimum of CTAs per SM ("nvvm.minctasm") is
+# retried only while it fits no more than that minimum: the step above it
+# (decode1: 2 -> 3 CTAs/SM) pays, a further one under the cap costs the
+# schedule more than the occupancy brings (sliding decode16, 3 -> 4 CTAs/SM
+# at 138 -> 128 registers: the main loop +640 cycles, graph us +2.6%).
+RETRY_SCHED_SLACK = (None, 16, 24)
+
+def regs_for_blocks(threads: int, blocks: int) -> int:
+    """Largest count with which `blocks` CTAs of `threads` fit on an SM
+    (SASS::maxRegCount: 16K registers per sub-partition, 8-register units,
+    a CTA's warps spread over the 4 sub-partitions)."""
+    warps = blocks * -(-threads // 32)
+    return min(16384 // (-(-warps // 4) * 32) // 8 * 8, 255)
+
+
+def next_step(threads: int, regs: int) -> int | None:
+    """Register count of the next occupancy step below `regs`, if any."""
+    warps = -(-threads // 32)
+    blocks = 1
+    while (blocks + 1) * warps <= 64 and regs_for_blocks(threads, blocks + 1) >= regs:
+        blocks += 1
+    if (blocks + 1) * warps > 64 or regs_for_blocks(threads, blocks) < regs:
+        return None
+    return regs_for_blocks(threads, blocks + 1)
+
+
+def blocks_fitting(threads: int, regs: int) -> int:
+    """CTAs of `threads` that fit on an SM with `regs` registers each."""
+    warps = -(-threads // 32)
+    blocks = 0
+    while (blocks + 1) * warps <= 64 and regs_for_blocks(threads, blocks + 1) >= regs:
+        blocks += 1
+    return blocks
+
+
+def kernel_attrs(ll: str, name: str) -> tuple[str, str] | None:
+    """(define line, its attributes text) of kernel `name` in IR text."""
+    m = re.search(rf"^define [^\n]*@{re.escape(name)}\([^\n]*$", ll, re.M)
+    if not m:
+        return None
+    line = m.group(0)
+    attrs = [line]
+    for g in re.findall(r" #(\d+)\b", line):
+        if a := re.search(rf"^attributes #{g} = \{{([^\n]*)\}}$", ll, re.M):
+            attrs.append(a.group(1))
+    return line, " ".join(attrs)
+
+
+def pragma(block: str, what: str) -> int:
+    m = re.search(rf"#pragma {what}\((\d+)\)", block)
+    return int(m.group(1)) if m else 0
+
+
+def spills(block: str) -> int:
+    return len(re.findall(r"^\s+(?:@!?U?P\w+ )?(?:STL|LDL)\b", block, re.M))
+
+
+def occupancy_retry(ll_path: Path, sass_path: Path, llc_cmd: list[str]) -> None:
+    ll = ll_path.read_text()
+    sass = sass_path.read_text()
+    blocks = kernels(sass)
+    caps = {}
+    for name, block in blocks.items():
+        found = kernel_attrs(ll, name)
+        if not found or '"nvvm.maxnreg"' in found[1]:
+            continue
+        if not (m := re.search(r'"nvvm.maxntid"="([\d,]+)"', found[1])):
+            continue
+        threads = 1
+        for d in m.group(1).split(","):
+            threads *= int(d)
+        regs = pragma(block, "MAXREG_COUNT")
+        if (mc := re.search(r'"nvvm.minctasm"="(\d+)"', found[1])) and \
+                blocks_fitting(threads, regs) > int(mc.group(1)):
+            continue
+        if ("USETMAXREG" not in block and (cap := next_step(threads, regs))
+                and re.search(r" #\d+\b", found[0])):
+            caps[name] = (cap, found[0])
+    if not caps:
+        return
+    for cap, line in caps.values():
+        group = re.findall(r" #\d+\b", line)[-1]
+        ll = ll.replace(line, line.replace(group, f'{group} "nvvm.maxnreg"="{cap}"', 1), 1)
+    retry_ll = ll_path.with_suffix(".maxnreg.ll")
+    retry_sass = sass_path.with_suffix(".maxnreg.sass")
+    retry_ll.write_text(ll)
+    for slack in RETRY_SCHED_SLACK:
+        extra = [f"-sass-sched-reg-slack={slack}"] if slack else []
+        run([*llc_cmd, *extra, str(retry_ll), "-o", str(retry_sass)])
+        capped = kernels(retry_sass.read_text())
+        for name, (cap, _) in list(caps.items()):
+            old, new = blocks[name], capped.get(name, "")
+            if (new and pragma(new, "MAXREG_COUNT") <= cap
+                    and pragma(new, "STACK_SIZE") <= pragma(old, "STACK_SIZE")
+                    and spills(new) <= spills(old)):
+                print(f"{name}: {pragma(old, 'MAXREG_COUNT')} -> {pragma(new, 'MAXREG_COUNT')} "
+                      f"registers (capped at {cap}{f', scheduler slack {slack}' if slack else ''})")
+                sass = sass.replace(old, new, 1)
+                del caps[name]
+        if not caps:
+            break
+    for name, (cap, _) in caps.items():
+        print(f"{name}: {pragma(blocks[name], 'MAXREG_COUNT')} registers (spills when capped at {cap})")
+    sass_path.write_text(sass)
+    retry_ll.unlink()
+    retry_sass.unlink()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("src", type=Path)
@@ -90,8 +209,10 @@ def main() -> int:
              "-fcuda-short-ptr", "-O3", "-S", "-emit-llvm", *FAST_MATH * opts.fast_math,
              "-include", str(ROOT / "kernels" / "cuda_min.h"), str(opts.src), "-o", str(ll)])
     sass_path = opts.out / f"{stem}.sass"
-    run([str(LLC), "-march=sass", f"-mcpu={cpu}", "-O3", *opts.llc_args.split(), str(ll),
-         "-o", str(sass_path)])
+    llc_cmd = [str(LLC), "-march=sass", f"-mcpu={cpu}", "-O3", *opts.llc_args.split()]
+    run([*llc_cmd, str(ll), "-o", str(sass_path)])
+    if opts.arch == "sm90" and ll.suffix == ".ll":
+        occupancy_retry(ll, sass_path, llc_cmd)
 
     from assembler import assemble
 

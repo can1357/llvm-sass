@@ -10,7 +10,9 @@
 #define LLVM_LIB_TARGET_SASS_SASS_H
 
 #include "MCTargetDesc/SASSMCTargetDesc.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/Register.h"
 #include "llvm/Support/CodeGen.h"
 #include <cstdint>
 
@@ -18,6 +20,8 @@ namespace llvm {
 class FunctionPass;
 class ModulePass;
 class SDNode;
+class SDLoc;
+class SDValue;
 class SelectionDAG;
 class MachineBasicBlock;
 class MachineInstr;
@@ -58,6 +62,10 @@ bool selectWarpIntrinsic(SelectionDAG &DAG, SDNode *N);
 /// returns the block where selection continues, or null for other
 /// instructions.
 MachineBasicBlock *expandPTXUniform(MachineInstr &MI, MachineBasicBlock *BB);
+/// The 64-bit L2 cache policy \p Pol (PTX .L2::cache_hint, createpolicy) as
+/// the uniform register pair a memory instruction names as its descriptor
+/// (desc[URa]): UMOVs of a constant, else R2URs (SASSISelPTX.cpp).
+SDValue policyDesc(SelectionDAG &DAG, SDValue Pol, const SDLoc &DL);
 
 /// Byte offset of a __constant__ (addrspace(4)) variable in constant bank 3.
 /// All addrspace(4) definitions of the module are laid out in declaration
@@ -66,9 +74,25 @@ uint64_t constOffset(const GlobalVariable &GV);
 /// External addrspace(4) global standing for address 0 of constant bank 0:
 /// SASSLowerKernelArgs rewrites by-value kernel parameters to offsets from it.
 inline constexpr const char KernelParamsSymbol[] = "__sass_kernel_params";
+/// Metadata of a load with PTX `ld` cache hints (SASSExpandInlinePTX): an
+/// i32 of SASS::InstFlagNA / InstFlagLTC* bits, carried to the AsmPrinter as
+/// target memory-operand flags (SASSTargetLowering::getTargetMMOFlags).
+inline constexpr const char LoadHintMD[] = "sass.ld.hint";
+/// Name prefixes of the callees standing for PTX ld/st with .L2::cache_hint
+/// (SASSExpandInlinePTX), lowered by SASSTargetLowering::lowerBuiltinCall
+/// to SASSISD::LDH*/STH and selected as LDG/STG/LD/ST desc[URa]: the full
+/// name is `<prefix>.<bytes>.p<addrspace>`.
+///   load:  {i32 x max(1, bytes/4)} (ptr p, i64 policy, i32 flags), flags
+///          bit 0: non-coherent (.nc), bits 1-3: SASS::LoadHintMD bits;
+///          a 1/2-byte load returns the zero-extended i32.
+///   store: void (ptr p, i64 policy, i32 x max(1, bytes/4) words).
+inline constexpr const char L2HintLoadFn[] = "__sass_ld_l2hint";
+inline constexpr const char L2HintStoreFn[] = "__sass_st_l2hint";
 /// Constant bank (0: kernel parameters, 3: __constant__ data) that an
-/// addrspace(4) access reads, from its memory operand's underlying objects.
-unsigned constBank(const MemSDNode &N);
+/// addrspace(4) access in \p F reads, from its memory operand's underlying
+/// objects, or, for a memory operand without an IR pointer, the only bank
+/// \p F reads.
+unsigned constBank(const MemSDNode &N, const Function &F);
 /// Prints a `#constant(3, name, offset, size[, bytes])` line for each
 /// __constant__ variable \p F uses.
 void printConstantObjects(const Function &F, raw_ostream &OS);
@@ -97,7 +121,16 @@ FunctionPass *createSASSLowerKernelArgsPass();
 /// generic, for InferAddressSpaces to form LDL/STL.
 FunctionPass *createSASSLowerAllocaPass();
 /// Rewrites small constant-size memcpys into wide aligned loads and stores.
-FunctionPass *createSASSLowerMemcpyPass();
+FunctionPass *createSASSLowerMemcpyPass(bool Memsets = false);
+/// Hopper: raises load/store alignments to what their addresses' known bits
+/// prove, so the load/store vectorizer can form .64/.128 accesses.
+FunctionPass *createSASSInferAlignPass();
+/// Hopper: 8/16-byte vector accesses with 8- or 16-bit elements as
+/// <2 x i32> / <4 x i32> (one wide LDG/LDS/STS instead of 32-bit pieces).
+FunctionPass *createSASSWideEltsPass();
+/// Hopper: loads through select trees of alloca offsets or of pointers as
+/// select trees of loads, so SROA can promote the allocas (lambda closures).
+FunctionPass *createSASSSpeculateLoadsPass();
 /// Inlines every device-function call into its kernel (there is no call ABI)
 /// and deletes the device functions; diagnoses recursion, indirect and
 /// external calls.
@@ -140,11 +173,29 @@ FunctionPass *createSASSLowerInlinePTXPass();
 FunctionPass *createSASSExpandInlinePTXPass();
 /// Turns register-staged global->shared copies into LDGSTS async copies.
 FunctionPass *createSASSAsyncCopyPass();
+/// Hopper: predicates `c ? smem[i] : x` triangles before scheduling.
+FunctionPass *createSASSPredicateLoadsPass();
+/// Zeroed register pairs as CS2R Rn, SRZ after allocation (sm_90).
+FunctionPass *createSASSZeroPairsPass();
+/// Moves warp-uniform integer computations into uniform registers (Hopper).
+FunctionPass *createSASSUniformRegsPass();
 /// Turns loop LDS addresses `LEA iv, base` into uniform-register IVs.
 FunctionPass *createSASSUniformAddrPass();
 /// Latency-driven, pressure-bounded list scheduling of each block before
 /// register allocation.
 FunctionPass *createSASSPreRASchedPass();
+/// Hopper: shifts by a constant in ALU-bound code become IMAD.SHL.U32.
+FunctionPass *createSASSPipeBalancePass();
+/// After register allocation, before rewriting: keeps spilled predicates in
+/// GPRs the allocation left free instead of local memory.
+FunctionPass *createSASSPredSpillsPass();
+/// Hopper, after coalescing: GPR pairs that only ever use one 32-bit lane
+/// become 32-bit vregs.
+FunctionPass *createSASSNarrowRegsPass();
+/// Hopper, SSA before RA: REG_SEQUENCE lanes and COPY sources read directly,
+/// `MOV 0` operands as RZ, LOP3s with known or repeated inputs simplified.
+FunctionPass *createSASSFoldLanesPass();
+extern char &SASSNarrowRegsID;
 /// Rewrites canonical wgmma.mma_async inline asm into HGMMA/QGMMA on
 /// accumulator tuples and expands setmaxnreg (SASSWGMMA.cpp; before RA).
 FunctionPass *createSASSExpandWGMMAPass();
@@ -169,6 +220,18 @@ bool isWarpgroupSync(const MachineInstr &MI);
 /// Whether divergent regions get convergence barriers (SASSReconverge) and
 /// IR values carry real uniformity: Hopper, or -sass-reconverge elsewhere.
 bool reconverges(const SASSSubtarget &ST);
+/// Whether a BRAc (selected divergent) takes one way for all threads of a
+/// warp: its predicate copies a uniform predicate, is a vote, or compares a
+/// value that is constant within each warp (threadIdx.x >> 5 and coarser, or
+/// threadIdx.x against a multiple of 32) with an immediate. \p OnlyTidX: the
+/// kernel reads neither threadIdx.y nor threadIdx.z (warps are runs of 32
+/// consecutive threadIdx.x). \p DefOf(User, Reg) is the instruction writing
+/// \p Reg that \p User reads, or null.
+bool branchesWarpUniformly(
+    const MachineInstr &Br, bool OnlyTidX,
+    function_ref<const MachineInstr *(const MachineInstr &, Register)> DefOf);
+/// Whether \p MF reads neither threadIdx.y nor threadIdx.z.
+bool readsOnlyTidX(const MachineFunction &MF);
 } // namespace SASS
 
 void initializeSASSAsmPrinterPass(PassRegistry &);
@@ -184,11 +247,21 @@ void initializeSASSLowerIntDivPass(PassRegistry &);
 void initializeSASSLiftIdiomsPass(PassRegistry &);
 void initializeSASSExpandInlinePTXPass(PassRegistry &);
 void initializeSASSPreRASchedPass(PassRegistry &);
+void initializeSASSPipeBalancePass(PassRegistry &);
+void initializeSASSPredSpillsPass(PassRegistry &);
+void initializeSASSNarrowRegsPass(PassRegistry &);
+void initializeSASSFoldLanesPass(PassRegistry &);
 void initializeSASSUniformAddrPass(PassRegistry &);
+void initializeSASSUniformRegsPass(PassRegistry &);
+void initializeSASSPredicateLoadsPass(PassRegistry &);
+void initializeSASSZeroPairsPass(PassRegistry &);
 void initializeSASSExpandWGMMAPass(PassRegistry &);
 void initializeSASSWGMMAHazardsPass(PassRegistry &);
 void initializeSASSReconvergePass(PassRegistry &);
 void initializeSASSLowerMemcpyPass(PassRegistry &);
+void initializeSASSInferAlignPass(PassRegistry &);
+void initializeSASSWideEltsPass(PassRegistry &);
+void initializeSASSSpeculateLoadsPass(PassRegistry &);
 void initializeSASSInlineCallsPass(PassRegistry &);
 } // namespace llvm
 

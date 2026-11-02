@@ -411,7 +411,7 @@ index c572094..422e289 100644
      for d in diags:
          inst = insts[d.instr_idx]
 diff --git a/assembler/sass_elf.py b/assembler/sass_elf.py
-index acb221d..0586153 100644
+index acb221d..0fe1efd 100644
 --- a/assembler/sass_elf.py
 +++ b/assembler/sass_elf.py
 @@ -301,8 +301,9 @@ class CubinBuilder:
@@ -453,7 +453,7 @@ index acb221d..0586153 100644
      def set_cluster_dims(self, dims: tuple[int, int, int] | None) -> None:
          """Cluster dimensions (x, y, z) → EIATTR_CTA_PER_CLUSTER + EXPLICIT
          cluster marker, so the driver accepts a cuLaunchKernelEx cluster
-@@ -442,7 +460,13 @@ class CubinBuilder:
+@@ -442,16 +460,28 @@ class CubinBuilder:
              elif op == 0x19b1:                    # SYNCS.CCTL (per-addr)
                  flags = 0x00000108 | (mbar_reg << 16)
              if flags is not None:
@@ -468,7 +468,25 @@ index acb221d..0586153 100644
          return entries
  
      @staticmethod
-@@ -466,7 +490,9 @@ class CubinBuilder:
+     def _compute_num_barriers(instructions: list[tuple[int, int]]) -> int:
+-        """Scan for BAR.SYNC (opcode 0xb1d), extract max named barrier + 1."""
++        """Scan BAR.SYNC/ARV/RED for the max named barrier + 1.  Opcodes by
++        operand form (barrier, count): 0xb1d imm/imm, 0x91d imm/reg (barrier
++        id Sb at [57:54]); 0x51d reg/imm, 0x31d reg/reg.  A register barrier
++        id can name any of the 16 barriers, so ptxas records 16 for it (a
++        smaller count makes BAR with a higher id an illegal instruction)."""
+         max_bar = -1
+-        bar_opcode = 0xb1d
+         for lo, hi in instructions:
+-            if (lo & 0xFFF) == bar_opcode:
++            op = lo & 0xFFF
++            if op in (0x51D, 0x31D):
++                return 16
++            if op in (0xB1D, 0x91D):
+                 n = (lo >> 54) & 0xF  # Sb at [57:54]
+                 if n > max_bar:
+                     max_bar = n
+@@ -466,7 +496,9 @@ class CubinBuilder:
  
      # ------------------------------------------------------------------
      def _mangle(self) -> str:
@@ -479,7 +497,7 @@ index acb221d..0586153 100644
  
      # ------------------------------------------------------------------
      def build(self) -> bytes:
-@@ -529,15 +555,17 @@ class CubinBuilder:
+@@ -529,15 +561,17 @@ class CubinBuilder:
          # rejected on Hopper with CUDA_ERROR_NO_BINARY_FOR_GPU).  sm100,
          # sm103 and sm120 share the Blackwell note/compat container ABI.
          _is_blackwell = arch.current().name in (
@@ -500,7 +518,7 @@ index acb221d..0586153 100644
                      flags=SHF_INFO_LINK | SHF_CUDA_RETAIN)
              else:
                  sec(".note.nv.cuver", SHT_NOTE,
-@@ -557,7 +585,7 @@ class CubinBuilder:
+@@ -557,7 +591,7 @@ class CubinBuilder:
          # after .text — the driver links a kernel's static shared window to
          # this symbol.
          sym_shared = None
@@ -509,7 +527,7 @@ index acb221d..0586153 100644
              sym_shared = symtab.add(strtab.add(f".nv.shared.{mn}"),
                                      STB_LOCAL, STT_SECTION, 0)
          if tcgen05_cta1:
-@@ -601,6 +629,17 @@ class CubinBuilder:
+@@ -601,6 +635,17 @@ class CubinBuilder:
                  STB_GLOBAL, STT_NOTYPE, 0, value=0x40)
          sym_cg = symtab.add(strtab.add(".nv.callgraph"),
                              STB_LOCAL, STT_SECTION, 0)
@@ -527,7 +545,7 @@ index acb221d..0586153 100644
          # st_other bit 4 = STO_ENTRY (cuobjdump -symbols prints 0x10 as
          # STO_ENTRY): marks the symbol as a kernel entry point.  Without it
          # the cubin loads and runs normally, but ncu's counter-enabled replay
-@@ -636,10 +675,16 @@ class CubinBuilder:
+@@ -636,10 +681,16 @@ class CubinBuilder:
          nv_info = eiattr_regcount(sym_func, self._regcount)
          if self._shader_type is not None:
              nv_info += eiattr_shader_type(sym_func, self._shader_type)
@@ -548,7 +566,7 @@ index acb221d..0586153 100644
          sec(".nv.info", SHT_CUDA_INFO, content=nv_info)
  
          # 8: .nv.info.<mangled> (per-kernel)
-@@ -735,6 +780,11 @@ class CubinBuilder:
+@@ -735,6 +786,11 @@ class CubinBuilder:
          buf += eiattr_hval(0x19, total_ps)  # CBANK_PARAM_SIZE
          buf += eiattr_param_cbank(sym_c0, param_base, total_ps)  # PARAM_CBANK
          buf += eiattr_sval(0x36, 8 if tcgen05_cta1 else 0)  # SW_WAR
@@ -560,7 +578,7 @@ index acb221d..0586153 100644
          sec(f".nv.info.{mn}", SHT_CUDA_INFO, content=buf,
              flags=SHF_INFO_LINK)
  
-@@ -768,6 +818,16 @@ class CubinBuilder:
+@@ -768,6 +824,16 @@ class CubinBuilder:
                          0x09, 0x00, 0x00, 0x00,
                          0x00, 0x00, 0x00, 0x00,
                      ])
@@ -577,7 +595,7 @@ index acb221d..0586153 100644
              else:
                  compat = bytes([
                      0x02, 0x02, 0x03 if tcgen05_cta1 else 0x01, 0x00,
-@@ -782,6 +842,14 @@ class CubinBuilder:
+@@ -782,6 +848,14 @@ class CubinBuilder:
          cg = struct.pack("<8i", 0, -1, 0, -2, 0, -3, 0, -4)
          sec(".nv.callgraph", SHT_CUDA_CALLGRAPH, content=cg, entsize=8)
  
@@ -592,7 +610,7 @@ index acb221d..0586153 100644
          # 11: .text.<mangled>
          raw = b"".join(struct.pack("<QQ", lo & MASK64, hi & MASK64)
                         for lo, hi in self._instructions)
-@@ -808,7 +876,7 @@ class CubinBuilder:
+@@ -808,7 +882,7 @@ class CubinBuilder:
          # the SHF_INFO_LINK bit is what marks it as the real shared image.
          # nvcc pads the declared size by 0x400 (the CTA shared base window):
          # 16KB of __shared__ -> a 0x4400 section, so usable = size - 0x400.
@@ -601,7 +619,7 @@ index acb221d..0586153 100644
              sec(f".nv.shared.{mn}", SHT_NOBITS, content=b"\x00" * (self._shared_mem + 0x400),
                  flags=SHF_WRITE | SHF_ALLOC | SHF_INFO_LINK, align=4, nobits=True)
  
-@@ -833,7 +901,8 @@ class CubinBuilder:
+@@ -833,7 +907,8 @@ class CubinBuilder:
          shmem_sec_name = ".nv.shared.reserved.0"
          cg_sec_name = ".nv.callgraph"
          c0_sec_name = f".nv.constant0.{mn}"
@@ -611,7 +629,7 @@ index acb221d..0586153 100644
  
          for i, s in enumerate(secs):
              if s.name == text_sec_name:
-@@ -863,6 +932,11 @@ class CubinBuilder:
+@@ -863,6 +938,11 @@ class CubinBuilder:
          symtab.entries[sym_cg].st_shndx = cg_sec_idx
          symtab.entries[sym_func].st_shndx = text_sec_idx
          symtab.entries[sym_c0].st_shndx = c0_sec_idx

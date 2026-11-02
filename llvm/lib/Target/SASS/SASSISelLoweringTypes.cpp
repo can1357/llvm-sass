@@ -54,6 +54,9 @@ void SASSTargetLowering::initTypeActions() {
   // rewritten in ReplaceNodeResults; two f32 roundings pack into one F2FP.
   setOperationAction(ISD::BITCAST, MVT::i16, Custom);
   setOperationAction(ISD::FP_ROUND, MVT::v2f32, Custom);
+  // copysign.f32 is bitwise (NaN payloads survive); the default expansion
+  // goes through FABS/FNEG, which are FADDs here.
+  setOperationAction(ISD::FCOPYSIGN, MVT::f32, Custom);
 
   // ATOMG/ATOM/ATOMS/RED handle 32- and 64-bit accesses; narrower ones are
   // compare-and-swap loops on the containing word (AtomicExpand).
@@ -61,6 +64,14 @@ void SASSTargetLowering::initTypeActions() {
   setMinCmpXchgSizeInBits(32);
   setOperationAction(ISD::ATOMIC_LOAD_SUB, {MVT::i32, MVT::i64}, Expand);
   setOperationAction(ISD::ATOMIC_FENCE, MVT::Other, Custom);
+  setOperationAction(ISD::ATOMIC_LOAD_FADD, {MVT::v2f16, MVT::v2bf16}, Legal);
+}
+
+/// <2 x half> or <2 x bfloat>: one 32-bit word.
+static bool isPackedHalf(const Type *T) {
+  auto *VT = dyn_cast<FixedVectorType>(T);
+  return VT && VT->getNumElements() == 2 &&
+         (VT->getElementType()->isHalfTy() || VT->getElementType()->isBFloatTy());
 }
 
 TargetLowering::AtomicExpansionKind
@@ -89,13 +100,29 @@ SASSTargetLowering::shouldExpandAtomicRMWInIR(const AtomicRMWInst *AI) const {
     return Bits == 32 ? AtomicExpansionKind::None
                       : AtomicExpansionKind::CmpXChg;
   case AtomicRMWInst::FAdd:
-    // ATOMG/ATOM.ADD.F32.FTZ.RN; shared memory has no float add.
-    return AI->getType()->isFloatTy() && !Shared
+    // ATOMG/ATOM.ADD.F32.FTZ.RN / .F16x2.RN / .BF16x2.RN; shared memory has
+    // no float add.
+    return (AI->getType()->isFloatTy() || isPackedHalf(AI->getType())) && !Shared
                ? AtomicExpansionKind::None
                : AtomicExpansionKind::CmpXChg;
   default:
     return AtomicExpansionKind::CmpXChg;
   }
+}
+
+// The compare-and-swap loops (shared packed-half adds) load and swap the
+// whole word as an integer.
+TargetLowering::AtomicExpansionKind
+SASSTargetLowering::shouldCastAtomicLoadInIR(LoadInst *LI) const {
+  return isPackedHalf(LI->getType()) ? AtomicExpansionKind::CastToInteger
+                                     : TargetLowering::shouldCastAtomicLoadInIR(LI);
+}
+
+TargetLowering::AtomicExpansionKind
+SASSTargetLowering::shouldCastAtomicStoreInIR(StoreInst *SI) const {
+  return isPackedHalf(SI->getValueOperand()->getType())
+             ? AtomicExpansionKind::CastToInteger
+             : TargetLowering::shouldCastAtomicStoreInIR(SI);
 }
 
 bool SASSTargetLowering::shouldInsertFencesForAtomic(
@@ -134,6 +161,18 @@ SDValue SASSTargetLowering::lowerTypesOp(SDValue Op, SelectionDAG &DAG) const {
     // Constant lanes are a copy (lane 0) or a PRMT (lane 1); variable ones
     // expand.
     return isa<ConstantSDNode>(Op.getOperand(1)) ? Op : SDValue();
+  case ISD::FCOPYSIGN: {
+    if (Op.getOperand(1).getValueType() != MVT::f32)
+      return SDValue(); // Mixed widths: default expansion.
+    SDLoc DL(Op);
+    SDValue Mag = DAG.getBitcast(MVT::i32, Op.getOperand(0));
+    SDValue Sgn = DAG.getBitcast(MVT::i32, Op.getOperand(1));
+    SDValue R = DAG.getNode(
+        ISD::OR, DL, MVT::i32,
+        DAG.getNode(ISD::AND, DL, MVT::i32, Mag, DAG.getConstant(0x7fffffff, DL, MVT::i32)),
+        DAG.getNode(ISD::AND, DL, MVT::i32, Sgn, DAG.getConstant(0x80000000, DL, MVT::i32)));
+    return DAG.getBitcast(MVT::f32, R);
+  }
   case ISD::ATOMIC_FENCE:
     // A single-thread fence only orders the compiler: keep the chain.
     if (Op.getConstantOperandVal(2) == SyncScope::SingleThread)

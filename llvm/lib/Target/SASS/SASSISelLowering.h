@@ -3,12 +3,28 @@
 #ifndef LLVM_LIB_TARGET_SASS_SASSISELLOWERING_H
 #define LLVM_LIB_TARGET_SASS_SASSISELLOWERING_H
 
+#include "MCTargetDesc/SASSBaseInfo.h"
 #include "SASSSelectionDAGInfo.h"
 #include "llvm/CodeGen/TargetLowering.h"
 
 namespace llvm {
 
 class SASSSubtarget;
+
+namespace SASS {
+/// A load's cache-hint bits (InstFlagNA, InstFlagLTCMask: bits 1-3) as the
+/// target memory-operand flags MOTargetFlag1-3, and back.
+constexpr unsigned LoadHintBits = InstFlagNA | InstFlagLTCMask;
+constexpr unsigned LoadHintMMOScale = MachineMemOperand::MOTargetFlag1 / InstFlagNA;
+static_assert(LoadHintBits == 0xe &&
+              MachineMemOperand::MOTargetFlag3 == 4 * MachineMemOperand::MOTargetFlag1);
+inline MachineMemOperand::Flags loadHintToMMOFlags(unsigned Hint) {
+  return MachineMemOperand::Flags((Hint & LoadHintBits) * LoadHintMMOScale);
+}
+inline unsigned loadHintOfMMOFlags(MachineMemOperand::Flags F) {
+  return (unsigned(F) / LoadHintMMOScale) & LoadHintBits;
+}
+} // namespace SASS
 
 /// Legal types: i1 (predicates), i32/f32 (R), i64 (aligned R pairs).
 /// Kernel parameters are pure loads from constant bank 0. Shared pointers are
@@ -48,6 +64,27 @@ public:
   EmitInstrWithCustomInserter(MachineInstr &MI,
                               MachineBasicBlock *MBB) const override;
 
+  bool isSDNodeSourceOfDivergence(const SDNode *N, FunctionLoweringInfo *FLI,
+                                  UniformityInfo *UA) const override;
+  /// A full-warp shfl.sync.idx of a constant lane (SASSTTIImpl::
+  /// getValueUniformity's lane broadcast): uniform whatever its source.
+  bool isSDNodeAlwaysUniform(const SDNode *N) const override;
+  /// PTX `ld` cache hints (SASS::LoadHintMD) for the AsmPrinter.
+  MachineMemOperand::Flags
+  getTargetMMOFlags(const Instruction &I) const override;
+  /// Hopper: a 64/128-bit access of 32-bit elements (sass-wide-elts) keeps
+  /// that type; re-typing it to its bitcast's 8/16-bit-element vector would
+  /// split it into 32-bit LDG/STGs.
+  bool isLoadBitCastBeneficial(EVT LoadVT, EVT BitcastVT,
+                               const SelectionDAG &DAG,
+                               const MachineMemOperand &MMO) const override;
+  bool isStoreBitCastBeneficial(EVT StoreVT, EVT BitcastVT,
+                                const SelectionDAG &DAG,
+                                const MachineMemOperand &MMO) const override;
+  /// isSDNodeSourceOfDivergence: the IR value of each value register.
+  mutable DenseMap<Register, const Value *> RegValue;
+  mutable const MachineFunction *RegValueMF = nullptr;
+  mutable size_t RegValueSize = 0;
   EVT getSetCCResultType(const DataLayout &DL, LLVMContext &Ctx,
                          EVT VT) const override;
   MVT getScalarShiftAmountTy(const DataLayout &, EVT) const override {
@@ -57,6 +94,12 @@ public:
                                   EVT VT) const override {
     return VT == MVT::f32 || isHalfType(VT);
   }
+  /// f32 fabs/fneg are FADD |a| / -a (as ptxas does abs/neg.f32; NaNs become
+  /// 7fffffff) and fold into source modifiers: keep the combiner from turning
+  /// them into integer masks next to bitcasts. Both, or its or-sign-bit and
+  /// fneg-of-bitcast folds undo each other forever. (Halves use LOP3 masks.)
+  bool isFAbsFree(EVT VT) const override { return VT == MVT::f32; }
+  bool isFNegFree(EVT VT) const override { return VT == MVT::f32; }
   bool isFPImmLegal(const APFloat &Imm, EVT VT,
                     bool ForCodeSize) const override {
     return VT == MVT::f32 || VT == MVT::f64 || VT == MVT::f16 || VT == MVT::bf16;
@@ -66,6 +109,8 @@ public:
   /// relaxed access at the instruction's scope.
   AtomicExpansionKind
   shouldExpandAtomicRMWInIR(const AtomicRMWInst *AI) const override;
+  AtomicExpansionKind shouldCastAtomicLoadInIR(LoadInst *LI) const override;
+  AtomicExpansionKind shouldCastAtomicStoreInIR(StoreInst *SI) const override;
   bool shouldInsertFencesForAtomic(const Instruction *I) const override;
   Instruction *emitLeadingFence(IRBuilderBase &Builder, Instruction *Inst,
                                 AtomicOrdering Ord) const override;
@@ -79,6 +124,9 @@ public:
   bool isLegalAddressingMode(const DataLayout &DL, const AddrMode &AM, Type *Ty,
                              unsigned AS,
                              Instruction *I = nullptr) const override;
+  bool getAddrModeArguments(const IntrinsicInst *II,
+                            SmallVectorImpl<Value *> &Ops,
+                            Type *&AccessTy) const override;
   /// Inline asm register constraints of the canonical wgmma.mma_async calls
   /// ("r", "f" -> GPR32, "l" -> GPR64; SASSWGMMA.cpp).
   ConstraintType getConstraintType(StringRef Constraint) const override;
@@ -98,10 +146,16 @@ private:
                          SelectionDAG &DAG) const;
   /// Operation actions for rounding and conversions (SASSISelConv.cpp).
   void initConvActions();
-  /// Calls to SASS builtins standing for instructions (SASS::FChkFn): the
-  /// chain, with the result in \p InVals; null for other calls.
+  /// Calls to SASS builtins standing for instructions (SASS::FChkFn,
+  /// L2HintLoadFn, L2HintStoreFn): the chain, with the result in \p InVals;
+  /// null for other calls.
   SDValue lowerBuiltinCall(CallLoweringInfo &CLI,
                            SmallVectorImpl<SDValue> &InVals) const;
+  /// PTX ld/st with an L2 cache policy (SASS::L2HintLoadFn/L2HintStoreFn
+  /// calls) as SASSISD::LDH*/STH memory nodes (SASSISelPTX.cpp); null for
+  /// other calls.
+  SDValue lowerL2HintCall(CallLoweringInfo &CLI,
+                          SmallVectorImpl<SDValue> &InVals) const;
   /// Custom lowering of the nodes initTypeActions marks Custom; a null
   /// SDValue means "expand".
   SDValue lowerTypesOp(SDValue Op, SelectionDAG &DAG) const;

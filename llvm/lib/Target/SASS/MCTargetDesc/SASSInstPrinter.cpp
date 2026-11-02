@@ -56,6 +56,17 @@ void SASSInstPrinter::printInst(const MCInst *MI, uint64_t Address,
       At = Op.size();
     Text.insert(Op.data() - Text.data() + At, ".FTZ");
   }
+  if (unsigned Hint =
+          MI->getFlags() & (SASS::InstFlagNA | SASS::InstFlagLTCMask)) {
+    // A global load's cache hints follow .E: LDG.E.NA.LTC256B.128.CONSTANT.
+    StringRef Op = StringRef(Text).ltrim();
+    if (Op.starts_with("LDG.E")) {
+      static const char *const LTC[] = {"", ".LTC64B", ".LTC128B", ".LTC256B"};
+      std::string Mods = Hint & SASS::InstFlagNA ? ".NA" : "";
+      Mods += LTC[(Hint & SASS::InstFlagLTCMask) >> SASS::InstFlagLTCShift];
+      Text.insert(Op.data() - Text.data() + strlen("LDG.E"), Mods);
+    }
+  }
   O << StringRef(Text).ltrim();
   printAnnotation(O, Annot);
 }
@@ -195,6 +206,16 @@ void SASSInstPrinter::printGlobalAddr(const MCInst *MI, unsigned OpNo,
   O << "desc[{UR4,UR5}][";
   printGroupReg(MI->getOperand(OpNo).getReg(), O);
   printOffset(MI->getOperand(OpNo + 1).getImm(), O);
+  O << ']';
+}
+
+void SASSInstPrinter::printGlobalDescAddr(const MCInst *MI, unsigned OpNo,
+                                          raw_ostream &O) {
+  O << "desc[";
+  printGroupReg(MI->getOperand(OpNo).getReg(), O);
+  O << "][";
+  printGroupReg(MI->getOperand(OpNo + 1).getReg(), O);
+  printOffset(MI->getOperand(OpNo + 2).getImm(), O);
   O << ']';
 }
 

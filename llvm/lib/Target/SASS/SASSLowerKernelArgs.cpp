@@ -52,8 +52,8 @@ SmallVector<SASS::ParamSlot, 8> SASS::paramLayout(const Function &F,
 }
 
 /// True if \p Ptr is only read: loaded from, directly or through GEPs, or
-/// the source of a memcpy. Collects the loads in \p Loads.
-static bool onlyRead(Value *Ptr, SmallVectorImpl<LoadInst *> &Loads) {
+/// the source of a memcpy.
+static bool onlyRead(Value *Ptr) {
   SmallVector<Value *, 8> Work = {Ptr};
   while (!Work.empty()) {
     Value *V = Work.pop_back_val();
@@ -66,9 +66,7 @@ static bool onlyRead(Value *Ptr, SmallVectorImpl<LoadInst *> &Loads) {
       } else if (auto *MT = dyn_cast<MemTransferInst>(Usr)) {
         if (&U != &MT->getRawSourceUse())
           return false;
-      } else if (auto *LI = dyn_cast<LoadInst>(Usr)) {
-        Loads.push_back(LI);
-      } else {
+      } else if (!isa<LoadInst>(Usr)) {
         return false;
       }
     }
@@ -136,21 +134,10 @@ private:
     Constant *Addr = ConstantExpr::getGetElementPtr(
         Type::getInt8Ty(Ctx), Params,
         ConstantInt::get(Type::getInt32Ty(Ctx), ParamBase + S.Offset));
-    SmallVector<LoadInst *, 8> Loads;
-    if (onlyRead(&A, Loads)) {
+    if (onlyRead(&A)) {
+      // (pointers loaded from it are global: SASSTargetMachine::
+      // getAssumedAddrSpace)
       A.replaceAllUsesWith(ConstantExpr::getAddrSpaceCast(Addr, A.getType()));
-      // As in NVPTX, pointers stored in a by-value parameter point to global
-      // memory.
-      for (LoadInst *LI : Loads)
-        if (LI->getType()->isPointerTy() &&
-            LI->getType()->getPointerAddressSpace() == 0 && !LI->use_empty()) {
-          IRBuilder<> LB(LI->getNextNode());
-          Value *Global = LB.CreateAddrSpaceCast(
-              LI, PointerType::get(M.getContext(), 1), LI->getName() + ".global");
-          Value *Generic = LB.CreateAddrSpaceCast(Global, LI->getType());
-          LI->replaceUsesWithIf(Generic,
-                                [&](Use &U) { return U.getUser() != Global; });
-        }
       return;
     }
     Type *Ty = A.getParamByValType();

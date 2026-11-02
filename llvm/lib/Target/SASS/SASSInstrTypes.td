@@ -201,6 +201,16 @@ defm AT_INC : AtomRMW<"INC", Op32, 1, 1>;
 defm AT_DEC : AtomRMW<"DEC", Op32, 1, 1>;
 defm AT_EXCH : AtomRMW<"EXCH", Op32, 0, 1>;
 defm AT_FADD : AtomRMW<"ADD.F32.FTZ.RN", Op32, 1, 0>;
+// sm_90 vector forms, atomic per element (SASSPipeBalance joins the scalars).
+defm AT_FADDX2 : AtomRMW<"ADD.F32x2.FTZ.RN", G64, 1, 0>;
+defm AT_FADDX4 : AtomRMW<"ADD.F32x4.FTZ.RN", G128, 1, 0>;
+// Packed halves (f16x2/bf16x2 per 32-bit word; x4/x8 joined by SASSPipeBalance).
+defm AT_HADD2 : AtomRMW<"ADD.F16x2.RN", Op32, 1, 0>;
+defm AT_HADD4 : AtomRMW<"ADD.F16x4.RN", G64, 1, 0>;
+defm AT_HADD8 : AtomRMW<"ADD.F16x8.RN", G128, 1, 0>;
+defm AT_BADD2 : AtomRMW<"ADD.BF16x2.RN", Op32, 1, 0>;
+defm AT_BADD4 : AtomRMW<"ADD.BF16x4.RN", G64, 1, 0>;
+defm AT_BADD8 : AtomRMW<"ADD.BF16x8.RN", G128, 1, 0>;
 defm AT_ADD64 : AtomRMW<"ADD.64", G64, 1, 0>;
 defm AT_SMIN64 : AtomRMW<"MIN.S64", G64, 1, 0>;
 defm AT_SMAX64 : AtomRMW<"MAX.S64", G64, 1, 0>;

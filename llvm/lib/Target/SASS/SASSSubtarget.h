@@ -65,6 +65,12 @@ public:
   // shared loads into one burst (attention: 1.050x vs 1.073x of nvcc).
   bool enableMachineScheduler() const override { return false; }
   bool enablePostRAScheduler() const override { return false; }
+
+  // Per-lane liveness of the wgmma accumulator tuples (GACC<n>): without it a
+  // tuple built lane by lane around a GMMA interferes as a whole and the
+  // allocator spills it (attention q_len 8: 1232 -> 704 stack bytes, 10x
+  // faster). Hopper only for now: Blackwell output stays as validated.
+  bool enableSubRegLiveness() const override { return !HasBlackwellISA; }
 };
 
 } // namespace llvm

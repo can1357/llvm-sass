@@ -5,11 +5,14 @@
 #include "SASS.h"
 #include "SASSMachineFunctionInfo.h"
 #include "SASSSubtarget.h"
+#include "llvm/Analysis/UniformityAnalysis.h"
+#include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/SelectionDAG.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -46,6 +49,11 @@ SASSTargetLowering::SASSTargetLowering(const TargetMachine &TM,
   // FMUL feeding each FFMA of an accumulator update) against pressure.
   setSchedulingPreference(Sched::Hybrid);
   setStackPointerRegisterToSaveRestore(SASS::R1);
+  // Hopper: a branch on `a && b` stays one branch on the combined predicate
+  // (CodeGenPrepare and the DAG builder otherwise split it into two, each a
+  // divergent region with its own BSSY/BSYNC), as NVPTX and ptxas.
+  if (!ST.hasBlackwellISA())
+    setJumpIsExpensive(true);
 
   for (MVT VT : {MVT::i32, MVT::i64}) {
     setOperationAction({ISD::SDIV, ISD::UDIV, ISD::SREM, ISD::UREM,
@@ -106,7 +114,7 @@ SASSTargetLowering::SASSTargetLowering(const TargetMachine &TM,
   for (MVT VT : {MVT::v2f32, MVT::v2i32, MVT::v4f32, MVT::v4i32})
     setOperationAction({ISD::LOAD, ISD::STORE}, VT, Custom);
 
-  setTargetDAGCombine(ISD::ADD);
+  setTargetDAGCombine({ISD::ADD, ISD::LOAD, ISD::BR});
   initTypeActions();
   initPTXActions();
   initConvActions();
@@ -336,10 +344,81 @@ static bool matchWideProduct(SDValue V, SelectionDAG &DAG, SDValue &X,
   return Widened(V.getOperand(1), Factor, OtherSigned) && OtherSigned == Signed;
 }
 
+/// The DAG combiner folds `select c, (load a), (load b)` into a load through
+/// `select c, a, b` whose memory operand has no IR pointer, so the constant
+/// bank it reads (SASS::constBank) is lost. Before legalization the
+/// addresses are still GlobalAddress nodes: when they all lie in one bank,
+/// point the memory operand at one of them.
+static void recoverConstBankPointer(LoadSDNode &LD) {
+  MachineMemOperand *MMO = LD.getMemOperand();
+  if (LD.getAddressSpace() != 4 || !MMO->getPointerInfo().V.isNull())
+    return;
+  SmallVector<SDValue, 4> Work = {LD.getBasePtr()};
+  const GlobalValue *Leaf = nullptr;
+  std::optional<bool> Params;
+  while (!Work.empty()) {
+    SDValue V = Work.pop_back_val();
+    if (V.getOpcode() == ISD::SELECT) {
+      Work.append({V.getOperand(1), V.getOperand(2)});
+      continue;
+    }
+    if (V.getOpcode() == ISD::SELECT_CC) {
+      Work.append({V.getOperand(2), V.getOperand(3)});
+      continue;
+    }
+    if (V.getOpcode() == ISD::ADD && isa<ConstantSDNode>(V.getOperand(1))) {
+      Work.push_back(V.getOperand(0));
+      continue;
+    }
+    auto *GA = dyn_cast<GlobalAddressSDNode>(V);
+    if (!GA || GA->getAddressSpace() != 4)
+      return;
+    bool P = GA->getGlobal()->getName() == SASS::KernelParamsSymbol;
+    if (Params && *Params != P)
+      return;
+    Params = P;
+    Leaf = GA->getGlobal();
+  }
+  MMO->setValue(Leaf);
+}
+
+// sm_90: `brcond (setcc p, C, eq|ne), T; br F` on a predicate p (a negated
+// mbarrier try_wait result: the generic combiner turns `xor p, -1` into that
+// setcc, which i1 promotion selects as SEL + ISETP, ~20 cycles per poll)
+// branches on p itself, swapping the targets when the setcc negates it.
+static SDValue combineBranchOnPredicate(SDNode *Br, SelectionDAG &DAG) {
+  SDValue BC = Br->getOperand(0);
+  if (DAG.getSubtarget<SASSSubtarget>().hasBlackwellISA() ||
+      BC.getOpcode() != ISD::BRCOND || !BC.hasOneUse())
+    return SDValue();
+  SDValue Cond = BC.getOperand(1);
+  if (Cond.getOpcode() != ISD::SETCC ||
+      Cond.getOperand(0).getValueType() != MVT::i1)
+    return SDValue();
+  auto *C = dyn_cast<ConstantSDNode>(Cond.getOperand(1));
+  ISD::CondCode CC = cast<CondCodeSDNode>(Cond.getOperand(2))->get();
+  if (!C || (CC != ISD::SETEQ && CC != ISD::SETNE))
+    return SDValue();
+  bool Negated = (CC == ISD::SETNE) == bool(C->getZExtValue() & 1);
+  SDValue T = BC.getOperand(2), F = Br->getOperand(1);
+  if (Negated)
+    std::swap(T, F);
+  SDLoc DL(Br);
+  SDValue NewBC = DAG.getNode(ISD::BRCOND, DL, MVT::Other, BC.getOperand(0),
+                              Cond.getOperand(0), T);
+  return DAG.getNode(ISD::BR, DL, MVT::Other, NewBC, F);
+}
+
 // Address arithmetic `base + (i64)idx * scale` is one IMAD.WIDE; forming it
 // before legalization keeps the 64-bit shift/mul from being split.
 SDValue SASSTargetLowering::PerformDAGCombine(SDNode *N,
                                               DAGCombinerInfo &DCI) const {
+  if (auto *LD = dyn_cast<LoadSDNode>(N)) {
+    recoverConstBankPointer(*LD);
+    return SDValue();
+  }
+  if (N->getOpcode() == ISD::BR)
+    return combineBranchOnPredicate(N, DCI.DAG);
   if (N->getOpcode() != ISD::ADD || N->getValueType(0) != MVT::i64)
     return SDValue();
   SelectionDAG &DAG = DCI.DAG;
@@ -349,6 +428,31 @@ SDValue SASSTargetLowering::PerformDAGCombine(SDNode *N,
     if (matchWideProduct(N->getOperand(I), DAG, X, Factor, Signed))
       return DAG.getNode(Signed ? SASSISD::MAD_WIDE : SASSISD::MAD_WIDE_U,
                          SDLoc(N), MVT::i64, X, Factor, N->getOperand(1 - I));
+  }
+  // Hopper, as ptxas: base + X * C with a full 64-bit X and a 32-bit
+  // constant C is IMAD.WIDE.U32 lo(X), C, base plus hi(X) * C into the high
+  // word, not a 64-bit multiply and a 64-bit add.
+  if (DAG.getSubtarget<SASSSubtarget>().hasBlackwellISA())
+    return SDValue();
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue M = N->getOperand(I);
+    auto *C = M.getOpcode() == ISD::MUL && M.hasOneUse()
+                  ? dyn_cast<ConstantSDNode>(M.getOperand(1))
+                  : nullptr;
+    if (!C || !isUInt<32>(C->getZExtValue()))
+      continue;
+    SDLoc DL(N);
+    SDValue X = M.getOperand(0);
+    SDValue CL = DAG.getConstant(C->getZExtValue(), DL, MVT::i32);
+    auto Half = [&](unsigned Opc, SDValue V) {
+      return DAG.getNode(Opc, DL, MVT::i32, V);
+    };
+    SDValue Wide = DAG.getNode(SASSISD::MAD_WIDE_U, DL, MVT::i64,
+                               Half(SASSISD::LO, X), CL, N->getOperand(1 - I));
+    SDValue Hi = DAG.getNode(
+        ISD::ADD, DL, MVT::i32, Half(SASSISD::HI, Wide),
+        DAG.getNode(ISD::MUL, DL, MVT::i32, Half(SASSISD::HI, X), CL));
+    return DAG.getNode(SASSISD::PAIR, DL, MVT::i64, Half(SASSISD::LO, Wide), Hi);
   }
   return SDValue();
 }
@@ -414,6 +518,120 @@ void SASSTargetLowering::getTgtMemIntrinsic(
   Infos.push_back(Info);
 }
 
+MachineMemOperand::Flags
+SASSTargetLowering::getTargetMMOFlags(const Instruction &I) const {
+  const MDNode *MD = I.getMetadata(SASS::LoadHintMD);
+  if (!MD)
+    return MachineMemOperand::MONone;
+  return SASS::loadHintToMMOFlags(
+      mdconst::extract<ConstantInt>(MD->getOperand(0))->getZExtValue());
+}
+
+/// A wide access's 32-bit-element type (isWideAccess) re-typed to a vector of
+/// narrower elements: the type legalizer would split that into 32-bit pieces.
+static bool narrowsWideAccess(EVT VT, EVT NewVT) {
+  return VT.isSimple() && NewVT.isVector() &&
+         NewVT.getScalarSizeInBits() < 32 &&
+         is_contained({MVT::v2f32, MVT::v2i32, MVT::v4f32, MVT::v4i32},
+                      VT.getSimpleVT().SimpleTy);
+}
+
+bool SASSTargetLowering::isLoadBitCastBeneficial(
+    EVT LoadVT, EVT BitcastVT, const SelectionDAG &DAG,
+    const MachineMemOperand &MMO) const {
+  if (!DAG.getSubtarget<SASSSubtarget>().hasBlackwellISA() &&
+      narrowsWideAccess(LoadVT, BitcastVT))
+    return false;
+  return TargetLowering::isLoadBitCastBeneficial(LoadVT, BitcastVT, DAG, MMO);
+}
+
+bool SASSTargetLowering::isStoreBitCastBeneficial(
+    EVT StoreVT, EVT BitcastVT, const SelectionDAG &DAG,
+    const MachineMemOperand &MMO) const {
+  if (!DAG.getSubtarget<SASSSubtarget>().hasBlackwellISA() &&
+      narrowsWideAccess(StoreVT, BitcastVT))
+    return false;
+  return TargetLowering::isStoreBitCastBeneficial(StoreVT, BitcastVT, DAG, MMO);
+}
+
+bool SASSTargetLowering::isSDNodeAlwaysUniform(const SDNode *N) const {
+  unsigned Base = N->getOpcode() == ISD::INTRINSIC_W_CHAIN ? 1 : 0;
+  if (N->getOpcode() != ISD::INTRINSIC_WO_CHAIN && N->getOpcode() != ISD::INTRINSIC_W_CHAIN)
+    return false;
+  uint64_t ID = N->getConstantOperandVal(Base);
+  if (ID != Intrinsic::nvvm_shfl_sync_idx_i32 && ID != Intrinsic::nvvm_shfl_sync_idx_f32)
+    return false;
+  // (mask, value, lane, clamp)
+  const auto *M = dyn_cast<ConstantSDNode>(N->getOperand(Base + 1));
+  const auto *L = dyn_cast<ConstantSDNode>(N->getOperand(Base + 3));
+  const auto *C = dyn_cast<ConstantSDNode>(N->getOperand(Base + 4));
+  return M && M->isAllOnes() && L && L->getZExtValue() < 32 && C &&
+         C->getZExtValue() == 0x1f;
+}
+
+// Hopper: nodes that start divergence, matching SASSTTIImpl::getValueUniformity
+// for IR values (other blocks' values through their virtual registers). Only
+// the uniform-operand selection of SASSISelPTX reads SDNode divergence.
+bool SASSTargetLowering::isSDNodeSourceOfDivergence(
+    const SDNode *N, FunctionLoweringInfo *FLI, UniformityInfo *UA) const {
+  if (!FLI || FLI->MF->getSubtarget<SASSSubtarget>().hasBlackwellISA() ||
+      isSDNodeAlwaysUniform(N))
+    return false;
+  switch (N->getOpcode()) {
+  case ISD::CopyFromReg: {
+    Register R = cast<RegisterSDNode>(N->getOperand(1))->getReg();
+    // (FunctionLoweringInfo::getValueFromVirtualReg freezes its map, and
+    // instruction selection still creates value registers afterwards.)
+    if (RegValueMF != FLI->MF || RegValueSize != FLI->ValueMap.size()) {
+      RegValue.clear();
+      for (auto [Val, Reg] : FLI->ValueMap)
+        RegValue[Reg] = Val;
+      RegValueMF = FLI->MF;
+      RegValueSize = FLI->ValueMap.size();
+    }
+    const Value *V = R.isVirtual() ? RegValue.lookup(R) : nullptr;
+    if (!V || !UA || UA->isDivergentAtDef(V))
+      return true;
+    // A value leaving a loop with a divergent exit is divergent at its uses.
+    const BasicBlock *BB = FLI->MBB ? FLI->MBB->getBasicBlock() : nullptr;
+    for (const Use &U : V->uses()) {
+      const auto *I = dyn_cast<Instruction>(U.getUser());
+      if ((!BB || (I && I->getParent() == BB)) && UA->isDivergentAtUse(U))
+        return true;
+    }
+    return false;
+  }
+  case ISD::LOAD: {
+    unsigned AS = cast<LoadSDNode>(N)->getAddressSpace();
+    return AS == 0 || AS == 5; // generic (may be local) or local
+  }
+  case ISD::INTRINSIC_WO_CHAIN:
+    switch (N->getConstantOperandVal(0)) {
+    case Intrinsic::nvvm_read_ptx_sreg_tid_x:
+    case Intrinsic::nvvm_read_ptx_sreg_tid_y:
+    case Intrinsic::nvvm_read_ptx_sreg_tid_z:
+    case Intrinsic::nvvm_read_ptx_sreg_laneid:
+    case Intrinsic::nvvm_read_ptx_sreg_lanemask_eq:
+    case Intrinsic::nvvm_read_ptx_sreg_lanemask_le:
+    case Intrinsic::nvvm_read_ptx_sreg_lanemask_lt:
+    case Intrinsic::nvvm_read_ptx_sreg_lanemask_ge:
+    case Intrinsic::nvvm_read_ptx_sreg_lanemask_gt:
+    case Intrinsic::nvvm_read_ptx_sreg_clock:
+    case Intrinsic::nvvm_read_ptx_sreg_clock64:
+    case Intrinsic::nvvm_read_ptx_sreg_globaltimer:
+      return true;
+    default:
+      return false;
+    }
+  case ISD::INTRINSIC_W_CHAIN: // memory, state, collectives
+  case ISD::INLINEASM:
+  case ISD::INLINEASM_BR:
+    return true;
+  default:
+    return isa<AtomicSDNode>(N);
+  }
+}
+
 EVT SASSTargetLowering::getSetCCResultType(const DataLayout &, LLVMContext &Ctx,
                                            EVT VT) const {
   if (VT.isVector())
@@ -434,6 +652,36 @@ bool SASSTargetLowering::isLegalAddressingMode(const DataLayout &,
   default:
     return false;
   }
+}
+
+/// Addresses of the memory intrinsics that select to reg + offset forms
+/// (LDGSTS, a small memset's stores): CodeGenPrepare then sinks an address
+/// computed in another block (clang hoists a tile's shared-memory slot
+/// addresses to the kernel entry) into the user, where the offset folds,
+/// instead of each slot address holding a register across the kernel.
+bool SASSTargetLowering::getAddrModeArguments(const IntrinsicInst *II,
+                                              SmallVectorImpl<Value *> &Ops,
+                                              Type *&AccessTy) const {
+  switch (II->getIntrinsicID()) {
+  case Intrinsic::nvvm_cp_async_ca_shared_global_4:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_4_s:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_8:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_8_s:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_16:
+  case Intrinsic::nvvm_cp_async_ca_shared_global_16_s:
+  case Intrinsic::nvvm_cp_async_cg_shared_global_16:
+  case Intrinsic::nvvm_cp_async_cg_shared_global_16_s:
+    Ops.push_back(II->getArgOperand(0));
+    Ops.push_back(II->getArgOperand(1));
+    break;
+  case Intrinsic::memset:
+    Ops.push_back(II->getArgOperand(0));
+    break;
+  default:
+    return false;
+  }
+  AccessTy = Type::getInt8Ty(II->getContext());
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -645,6 +893,17 @@ SDValue SASSTargetLowering::lowerShift64(SDValue Op, SelectionDAG &DAG) const {
     return pair(S == 32 ? Hi : I32(Opc, Hi, S - 32), NewHi, DL, DAG);
   }
 
+  // sm_90: a register amount takes the clamping funnels, as ptxas's
+  // shl.b64 (SHF.L.U32 lo; SHF.L.U64.HI hi) instead of the generic
+  // expansion's compare and selects around amount 32.
+  if (Opc == ISD::SHL && !DAG.getSubtarget<SASSSubtarget>().hasBlackwellISA()) {
+    SDValue S = DAG.getZExtOrTrunc(Amt, DL, MVT::i32);
+    SDValue G = DAG.getRegister(SASS::PT, MVT::i1);
+    SDValue G0 = DAG.getTargetConstant(0, DL, MVT::i32);
+    SDValue NewLo(DAG.getMachineNode(SASS::SHLrr, DL, MVT::i32, {Lo, S, G, G0}), 0);
+    SDValue NewHi(DAG.getMachineNode(SASS::SHLU64HIrr, DL, MVT::i32, {Lo, S, Hi, G, G0}), 0);
+    return pair(NewLo, NewHi, DL, DAG);
+  }
   unsigned PartsOpc = Opc == ISD::SHL   ? ISD::SHL_PARTS
                       : Opc == ISD::SRL ? ISD::SRL_PARTS
                                         : ISD::SRA_PARTS;

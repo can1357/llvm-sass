@@ -32,9 +32,12 @@ def : Pat<(v2f16 (int_nvvm_ex2_approx v2f16:$a)),
                             GPR32)>;
 
 // Named barriers: bar.sync / barrier.sync / bar.arrive with an id and an
-// optional thread count, each an immediate or a register.
+// optional thread count, each an immediate or a register. Register operands
+// are read after issue: a read scoreboard holds back later writers (ptxas
+// sets one on every BAR with a register; without it a barrier id register
+// rewritten right after BAR.SYNC sends the warp to another barrier).
 let LatMnem = LAT_BAR, MinStall = 6, hasSideEffects = 1, isConvergent = 1,
-    isPredicable = 0, NoGuard = 1 in {
+    isPredicable = 0, NoGuard = 1, ReadSB = 1 in {
 def BAR_SYNC_I : SASSInst<(outs), (ins simm32:$id), "BAR.SYNC.DEFER_BLOCKING $id">;
 def BAR_SYNC_R : SASSInst<(outs), (ins GPR32:$id), "BAR.SYNC.DEFER_BLOCKING $id">;
 foreach Kind = [["SYNC", "BAR.SYNC.DEFER_BLOCKING"], ["ARV", "BAR.ARV"]] in {
@@ -81,14 +84,21 @@ def CS2R_GLOBALTIMER : SASSInst<(outs G64:$d), (ins), "CS2R $d, SR_GLOBALTIMERLO
 def CS2R_CLOCK64 : SASSInst<(outs G64:$d), (ins), "CS2R $d, SR_CLOCKLO",
                             [(set i64:$d, (int_nvvm_read_ptx_sreg_clock64))]>;
 }
+// Zero into a register pair (ptxas clears accumulators this way); formed
+// after allocation by SASSZeroPairs from two MOV Rn, 0x0.
+let LatMnem = LAT_SEL, isAsCheapAsAMove = 1 in
+def CS2R_SRZ : SASSInst<(outs G64:$d), (ins), "CS2R $d, SRZ">;
 def : Pat<(int_nvvm_read_ptx_sreg_cluster_ctarank), (S2R_CGA)>;
 let Predicates = [NoBlackwellISA] in
 def : Pat<(int_nvvm_read_ptx_sreg_cluster_nctarank), (LDC32 0x188)>;
 
-// Prefetches into L1/L2 (CCTL on a 64-bit generic or global address).
+// Prefetches into L1/L2 (CCTL on a 64-bit generic or global address). The
+// address is read after issue, as for any MIO instruction, so it is released
+// on a read scoreboard (ptxas: CCTL.E.PF2 [R4] ;[wr=7:rd=1]); without one a
+// later write of the address register can redirect the prefetch.
 let LatMnem = LAT_LDG, hasSideEffects = 1, mayLoad = 1, Uses = [URD2] in {
-def CCTL_PF1 : SASSInst<(outs), (ins G64:$a), "CCTL.E.PF1 [$a]">;
-def CCTL_PF2 : SASSInst<(outs), (ins G64:$a), "CCTL.E.PF2 [$a]">;
+def CCTL_PF1 : SASSVarInst<(outs), (ins G64:$a), "CCTL.E.PF1 [$a]">;
+def CCTL_PF2 : SASSVarInst<(outs), (ins G64:$a), "CCTL.E.PF2 [$a]">;
 }
 def : Pat<(int_nvvm_prefetch_global_L2 i64:$a), (CCTL_PF2 $a)>;
 def : Pat<(int_nvvm_prefetch_L2 i64:$a), (CCTL_PF2 $a)>;
@@ -208,6 +218,13 @@ def UBLKCP_SG : SASSVarInst<(outs), (ins UG64:$dm, UG64:$src, UGPR32:$n),
 def UBLKCP_GS : SASSVarInst<(outs), (ins UG64:$dst, UGPR32:$src, UGPR32:$n),
                             "UBLKCP.G.S $dst, $src, $n">;
 def UBLKPF_L2 : SASSVarInst<(outs), (ins UG64:$src, UGPR32:$n), "UBLKPF.L2 $src, $n">;
+// With an L2 cache policy (.L2::cache_hint) as the descriptor pair.
+def UBLKCP_SG_D : SASSVarInst<(outs), (ins UG64:$dm, UG64:$src, UGPR32:$n, UG64:$pol),
+                              "UBLKCP.S.G $dm, $src, $n, desc[$pol]">;
+def UBLKCP_GS_D : SASSVarInst<(outs), (ins UG64:$dst, UGPR32:$src, UGPR32:$n, UG64:$pol),
+                              "UBLKCP.G.S $dst, $src, $n, desc[$pol]">;
+def UBLKPF_L2_D : SASSVarInst<(outs), (ins UG64:$src, UGPR32:$n, UG64:$pol),
+                              "UBLKPF.L2 $src, $n, desc[$pol]">;
 // Tensor copies: a group of 4 (2D) or 8 uniform registers {dst|src, mbar,
 // coordinates...}, and the tensor map's address.
 // The group is {smem, mbarrier (loads only), coordinates...} padded to 4 or
@@ -222,6 +239,12 @@ def UTMALDG_#D[0] : SASSVarInst<(outs), !if(!eq(D[1], "4"), G4, G8),
                                 "UTMALDG."#D[0]#" "#!if(!eq(D[1], "4"), S4, S8)#", $map">;
 def UTMASTG_#D[0] : SASSVarInst<(outs), !if(!eq(D[2], "4"), G4, G8),
                                 "UTMASTG."#D[0]#" "#!if(!eq(D[2], "4"), S4, S8)#", $map">;
+def UTMALDG_#D[0]#_D : SASSVarInst<(outs), !con(!if(!eq(D[1], "4"), G4, G8), (ins UG64:$pol)),
+                                   "UTMALDG."#D[0]#" "#!if(!eq(D[1], "4"), S4, S8)#
+                                   ", $map, desc[$pol]">;
+def UTMASTG_#D[0]#_D : SASSVarInst<(outs), !con(!if(!eq(D[2], "4"), G4, G8), (ins UG64:$pol)),
+                                   "UTMASTG."#D[0]#" "#!if(!eq(D[2], "4"), S4, S8)#
+                                   ", $map, desc[$pol]">;
 }
 def UTMACCTL_PF : SASSVarInst<(outs), (ins UG64:$map), "UTMACCTL.PF $map">;
 }
@@ -235,6 +258,11 @@ def DEPBAR_LE_SB0 : SASSInst<(outs), (ins i32imm:$n), "DEPBAR.LE SB0, $n">;
 
 let usesCustomInserter = 1, hasSideEffects = 1, mayLoad = 1, mayStore = 1,
     isPredicable = 0, NoGuard = 1 in {
+// Hopper, operands warp-uniform (SDNode divergence): no waterfall loop.
+def UNIU_SYNCS_EXCH : SASSInst<(outs), (ins GPR32:$a, GPR32:$lo, GPR32:$hi), "">;
+def UNIU_UBLKCP_SG : SASSInst<(outs), (ins GPR32:$dst, GPR32:$mbar, G64:$src, GPR32:$n), "">;
+def UNIU_ARRIVES_ARVCNT : SASSInst<(outs), (ins GPR32:$a), "">;
+def UNIU_ARRIVES_TRANSCNT : SASSInst<(outs), (ins GPR32:$a), "">;
 def UNI_SYNCS_EXCH : SASSInst<(outs), (ins GPR32:$a, GPR32:$lo, GPR32:$hi), "">;
 def UNI_ARRIVES_ARVCNT : SASSInst<(outs), (ins GPR32:$a), "">;
 def UNI_ARRIVES_TRANSCNT : SASSInst<(outs), (ins GPR32:$a), "">;
@@ -248,6 +276,20 @@ def UNI_UTMALDG : SASSInst<(outs), (ins i32imm:$dim, G64:$map, GPR32:$s, GPR32:$
                                         GPR32:$c0, GPR32:$c1, GPR32:$c2, GPR32:$c3, GPR32:$c4), "">;
 def UNI_UTMASTG : SASSInst<(outs), (ins i32imm:$dim, G64:$map, GPR32:$s,
                                         GPR32:$c0, GPR32:$c1, GPR32:$c2, GPR32:$c3, GPR32:$c4), "">;
+// _H: the same with an L2 cache policy, already in a uniform register pair
+// (SASS::policyDesc), after the other operands.
+def UNIU_UBLKCP_SG_H : SASSInst<(outs), (ins GPR32:$dst, GPR32:$mbar, G64:$src, GPR32:$n,
+                                             UG64:$pol), "">;
+def UNI_UBLKCP_SG_H : SASSInst<(outs), (ins GPR32:$dst, GPR32:$mbar, G64:$src, GPR32:$n,
+                                            UG64:$pol), "">;
+def UNI_UBLKCP_GS_H : SASSInst<(outs), (ins G64:$dst, GPR32:$src, GPR32:$n, UG64:$pol), "">;
+def UNI_UBLKPF_L2_H : SASSInst<(outs), (ins G64:$src, GPR32:$n, UG64:$pol), "">;
+def UNI_UTMALDG_H : SASSInst<(outs), (ins i32imm:$dim, G64:$map, GPR32:$s, GPR32:$mbar,
+                                          GPR32:$c0, GPR32:$c1, GPR32:$c2, GPR32:$c3, GPR32:$c4,
+                                          UG64:$pol), "">;
+def UNI_UTMASTG_H : SASSInst<(outs), (ins i32imm:$dim, G64:$map, GPR32:$s,
+                                          GPR32:$c0, GPR32:$c1, GPR32:$c2, GPR32:$c3, GPR32:$c4,
+                                          UG64:$pol), "">;
 }
 
 // Loop pieces for the expansion.
@@ -279,7 +321,7 @@ def : Pat<(int_nvvm_is_explicit_cluster), (ISETPri (LDC32 0x140), 1, 4, (i1 PT),
 // Shared::cluster addresses are 32-bit; with the shared window's high word
 // they form a generic address: shared::cluster accesses are generic LD/ST.
 def SASSswinhi : SDNode<"SASSISD::SWINHI", SDTypeProfile<1, 0, [SDTCisVT<0, i32>]>>;
-let LatMnem = LAT_S2R, SchedRW = [WriteS2R] in
+let LatMnem = LAT_S2R, SchedRW = [WriteS2R], isReMaterializable = 1 in
 def S2R_SWINHI : SASSVarInst<(outs GPR32:$d), (ins), "S2R $d, SR_SWINHI",
                              [(set i32:$d, (SASSswinhi))]>;
 def ClusterGeneric : OutPatFrag<(ops node:$a),

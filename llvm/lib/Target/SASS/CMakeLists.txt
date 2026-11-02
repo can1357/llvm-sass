@@ -34,7 +34,13 @@ add_llvm_target(SASSCodeGen
   SASSLocalMemory.cpp
   SASSLowerKernelArgs.cpp
   SASSLowerMemcpy.cpp
+  SASSMemAlign.cpp
+  SASSSpeculateLoads.cpp
   SASSPreRASched.cpp
+  SASSPipeBalance.cpp
+  SASSPredicateLoads.cpp
+  SASSZeroPairs.cpp
+  SASSPredSpills.cpp
   SASSRegisterInfo.cpp
   SASSSelectionDAGInfo.cpp
   SASSSubtarget.cpp

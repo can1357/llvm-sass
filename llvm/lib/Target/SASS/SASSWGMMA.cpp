@@ -24,6 +24,12 @@
 // no-swizzle MN-major B, 128/(swizzle width in elements) LBO strides for
 // swizzled MN-major B).
 //
+// A GMMA reads its A fragment until the wgmma.wait_group that retires its
+// group; with -sass-wgmma-live-frags SASSExpandWGMMA gives each
+// WARPGROUP.DEPBAR that retires an RS GMMA an implicit use of the fragment
+// (through PHIs when the wait is on the next loop iteration), so the
+// allocator keeps the registers until then.
+//
 // SASSExpandWGMMA also expands setmaxnreg as ptxas does: WARPSYNC.ALL, then
 // USETMAXREG.DEALLOC, or a USETMAXREG.TRY_ALLOC retry loop. Like ptxas it
 // ignores setmaxnreg in kernels without __launch_bounds__(threads,
@@ -35,9 +41,12 @@
 //   groups); a commit without such a GMMA (empty group, group spanning
 //   blocks) makes every GMMA its own group and every wait a full wait,
 // * keeps instructions off registers that in-flight GMMAs read or write
-//   (accumulators, A fragment) by inserting WARPGROUP.DEPBAR.LE gsb0, 0x0,
-//   and inserts WARPGROUP.ARRIVE before a GMMA whose register sources were
-//   written since the last one (ptxas remarks C7514 / C7519), each arrive
+//   (accumulators, A fragment), GMMAs included unless they only share A
+//   fragments or chain on one accumulator tuple, by inserting
+//   WARPGROUP.DEPBAR.LE gsb0, 0x0,
+//   and inserts WARPGROUP.ARRIVE before a GMMA whose registers (accumulators,
+//   write-only ones included, and A fragment) other instructions read or
+//   wrote since the last one (ptxas remarks C7514 / C7519), each arrive
 //   preceded by WARPSYNC.ALL to reconverge the warp,
 // * checks that each region after a setmaxnreg uses only registers below
 //   its count.
@@ -54,13 +63,35 @@
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/MachineSSAUpdater.h"
+#include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 namespace GMMA = SASS::GMMA;
+
+static cl::opt<bool>
+    HoistDesc("sass-wgmma-hoist-desc", cl::init(true), cl::Hidden,
+              cl::desc("Hoist loop-invariant wgmma descriptor halves to "
+                       "uniform registers in the loop preheader"));
+
+static cl::opt<bool>
+    BankHints("sass-bank-hints", cl::init(true), cl::Hidden,
+              cl::desc("Hopper: prefer the register-file bank (register "
+                       "parity) other than that of the registers read "
+                       "together with a 32-bit virtual register"));
+
+static cl::opt<bool>
+    LiveFrags("sass-wgmma-live-frags", cl::init(false), cl::Hidden,
+              cl::desc("Keep RS wgmma A fragments allocated until the "
+                       "wait_group that retires them instead of waiting "
+                       "before their registers are reused"));
 
 //===----------------------------------------------------------------------===//
 // Inline asm constraints
@@ -115,6 +146,8 @@ static const unsigned SubIdx[64] = {
     SASS::sub48, SASS::sub49, SASS::sub50, SASS::sub51, SASS::sub52, SASS::sub53,
     SASS::sub54, SASS::sub55, SASS::sub56, SASS::sub57, SASS::sub58, SASS::sub59,
     SASS::sub60, SASS::sub61, SASS::sub62, SASS::sub63};
+
+constexpr unsigned MaxGroups = 7; // WARPGROUP.DEPBAR.LE takes 0..7.
 
 static const TargetRegisterClass *const AccClasses[] = {
     &SASS::GACC8RegClass,  &SASS::GACC12RegClass, &SASS::GACC16RegClass,
@@ -219,17 +252,48 @@ bool SASSRegisterInfo::getRegAllocationHints(
     const VirtRegMap *VRM, const LiveRegMatrix *Matrix) const {
   bool Hard = TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints,
                                                         MF, VRM, Matrix);
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  // Hopper's register file has two banks, by register parity, each reading
+  // one warp-wide operand per clock for all of a sub-core's warps
+  // (sass-dec notes/sm90/arch/register_bandwidth.md): an instruction reading
+  // two registers of one parity takes a second clock. A 32-bit register
+  // prefers the parity its fellow sources (already assigned) have least,
+  // e.g. a dequantized weight the other parity than the scale it is
+  // multiplied by.
+  int Parity = -1;
+  if (BankHints && VRM && !MF.getSubtarget<SASSSubtarget>().hasBlackwellISA() &&
+      MRI.getRegClass(VirtReg) == &SASS::GPR32RegClass) {
+    int Votes[2] = {0, 0};
+    for (const MachineOperand &MO : MRI.use_nodbg_operands(VirtReg))
+      for (const MachineOperand &U : MO.getParent()->uses()) {
+        if (!U.isReg() || U.isImplicit() || !U.getReg() ||
+            U.getReg() == VirtReg)
+          continue;
+        MCRegister P;
+        if (U.getReg().isPhysical())
+          P = U.getReg();
+        else if (U.getReg().isVirtual() && VRM->hasPhys(U.getReg()))
+          P = VRM->getPhys(U.getReg());
+        if (P && U.getSubReg())
+          P = getSubReg(P, U.getSubReg());
+        if (P && P != SASS::RZ && SASS::GPR32RegClass.contains(P))
+          ++Votes[getEncodingValue(P) & 1];
+      }
+    if (Votes[0] != Votes[1])
+      Parity = Votes[0] > Votes[1];
+  }
   const auto &Limits = MF.getInfo<SASSFunctionInfo>()->RegLimit;
-  if (Limits.empty())
-    return Hard;
   unsigned L = ~0u;
-  for (const MachineInstr &MI : MF.getRegInfo().reg_nodbg_instructions(VirtReg))
-    if (auto It = Limits.find(MI.getParent()); It != Limits.end())
-      L = std::min(L, It->second);
-  if (L == ~0u)
+  if (!Limits.empty())
+    for (const MachineInstr &MI : MRI.reg_nodbg_instructions(VirtReg))
+      if (auto It = Limits.find(MI.getParent()); It != Limits.end())
+        L = std::min(L, It->second);
+  if (L == ~0u && Parity < 0)
     return Hard;
   // Only registers whose 32-bit lanes all lie below L - 2.
   auto Fits = [&](MCPhysReg R) {
+    if (L == ~0u)
+      return true;
     for (MCRegUnit U : regunits(R))
       for (MCRegUnitRootIterator Root(U, this); Root.isValid(); ++Root)
         if (SASS::GPR32RegClass.contains(*Root) && getEncodingValue(*Root) + 3 > L)
@@ -241,6 +305,13 @@ bool SASSRegisterInfo::getRegAllocationHints(
   for (MCPhysReg R : Pref)
     if (Fits(R) && is_contained(Order, R))
       Hints.push_back(R);
+  if (Parity >= 0)
+    for (MCPhysReg R : Order)
+      if (int(getEncodingValue(R) & 1) == Parity && Fits(R) &&
+          !is_contained(Hints, R))
+        Hints.push_back(R);
+  if (L == ~0u)
+    return Hard;
   for (MCPhysReg R : Order)
     if (Fits(R) && !is_contained(Hints, R))
       Hints.push_back(R);
@@ -264,9 +335,18 @@ private:
   MachineRegisterInfo *MRI = nullptr;
   const SASSInstrInfo *TII = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
+  /// The descriptor R2URs built by expandWGMMA.
+  SmallVector<MachineInstr *, 16> DescR2URs;
+  /// RS GMMAs (the last part) and their A fragments.
+  SmallVector<std::pair<MachineInstr *, Register>, 8> RSFrags;
 
   void expandWGMMA(MachineInstr &MI);
+  void extendFragments(MachineFunction &MF);
   void expandSetMaxNReg(MachineInstr &MI);
+  bool hoistableChain(Register R, const MachineLoop *L, unsigned Depth,
+                      const MachineInstr *User,
+                      SmallVectorImpl<MachineInstr *> &Chain);
+  void hoistInvariantDescriptors(const MachineLoopInfo &MLI);
   Register vreg(const TargetRegisterClass *RC) {
     return MRI->createVirtualRegister(RC);
   }
@@ -461,7 +541,9 @@ void SASSExpandWGMMA::expandWGMMA(MachineInstr &MI) {
 
   auto ToUR = [&](Register G64, unsigned Sub) {
     Register U = vreg(&SASS::UGPR32RegClass);
-    noGuard(BuildMI(MBB, MI, DL, TII->get(SASS::R2UR), U).addReg(G64, {}, Sub));
+    auto MIB = BuildMI(MBB, MI, DL, TII->get(SASS::R2UR), U).addReg(G64, {}, Sub);
+    noGuard(MIB);
+    DescR2URs.push_back(MIB);
     return U;
   };
   auto ToURReg = [&](Register G32) {
@@ -554,6 +636,7 @@ void SASSExpandWGMMA::expandWGMMA(MachineInstr &MI) {
 
   // One GMMA per part of at most 64 accumulator registers.
   unsigned Parts = Regs > 64 ? 2 : 1;
+  MachineInstr *LastG = nullptr;
   for (unsigned Part = 0; Part < Parts; ++Part) {
     unsigned First = Part * 64, Cnt = Parts == 1 ? Regs : (Part ? Regs - 64 : 64);
     unsigned PFlags = Parts == 1 ? Flags
@@ -626,11 +709,83 @@ void SASSExpandWGMMA::expandWGMMA(MachineInstr &MI) {
       G.addReg(UP).addImm(0);
     }
     noGuard(G);
+    LastG = G;
     for (unsigned I = 0; I < Cnt; ++I)
       BuildMI(MBB, MI, DL, TII->get(TargetOpcode::COPY), DOut[First + I])
           .addReg(Out, {}, SubIdx[I]);
   }
+  if (RS)
+    RSFrags.emplace_back(LastG, AFrag);
   MI.eraseFromParent();
+}
+
+/// The A fragment of an RS GMMA is read until the WARPGROUP.DEPBAR that
+/// retires the GMMA's group, but its last use is the GMMA: the allocator
+/// hands its registers to the next values (the next step's fragment, a
+/// following GMMA's accumulators) and SASSWGMMAHazards then waits for every
+/// group before they are written. With -sass-wgmma-live-frags an implicit
+/// use on each retiring DEPBAR keeps the fragment live instead, so the
+/// group stays in flight; MachineSSAUpdater threads it through PHIs
+/// (undefined on paths that do not issue the GMMA) when the wait is on the
+/// next loop iteration. Groups count as in PTX: the GMMA joins the group of
+/// the next commit_group, and wait_group N retires it once more than N
+/// commits followed it. When a path reaches the fragment's definition again
+/// first, the next instance would need the same registers while this one
+/// is in flight: no extension. Off by default: under a tight register count
+/// (moe MAIN at 96, two groups in flight) the longer live ranges spilled
+/// 456 bytes more than waiting does.
+void SASSExpandWGMMA::extendFragments(MachineFunction &MF) {
+  constexpr unsigned Saturated = MaxGroups + 1; // retired by any DEPBAR
+  for (auto [G, Frag] : RSFrags) {
+    const MachineInstr *Def = MRI->getVRegDef(Frag);
+    MachineBasicBlock *GB = G->getParent();
+    // Retiring DEPBARs; true when after G in G's block.
+    SmallVector<std::pair<MachineInstr *, bool>, 4> Waits;
+    SmallVector<std::tuple<MachineBasicBlock *, MachineBasicBlock::iterator,
+                           unsigned>, 8>
+        Work;
+    DenseSet<std::pair<MachineBasicBlock *, unsigned>> Seen;
+    Work.emplace_back(GB, std::next(G->getIterator()), 0);
+    bool Reached = false;
+    while (!Reached && !Work.empty()) {
+      MachineBasicBlock *B;
+      MachineBasicBlock::iterator I;
+      unsigned K;
+      std::tie(B, I, K) = Work.pop_back_val();
+      bool Direct = B == GB && I != B->begin(), Retired = false;
+      for (; I != B->end(); ++I) {
+        MachineInstr *MI = &*I;
+        if (MI == Def) {
+          Reached = true;
+          break;
+        }
+        if (MI->getOpcode() == SASS::WGMMA_COMMIT) {
+          K = std::min(K + 1, Saturated);
+        } else if (MI->getOpcode() == SASS::WARPGROUP_DEPBAR &&
+                   K > static_cast<unsigned>(MI->getOperand(0).getImm())) {
+          if (none_of(Waits, [MI](auto &W) { return W.first == MI; }))
+            Waits.emplace_back(MI, Direct);
+          Retired = true;
+          break;
+        }
+      }
+      if (Reached || Retired)
+        continue;
+      for (MachineBasicBlock *S : B->successors())
+        if (Seen.insert({S, K}).second)
+          Work.emplace_back(S, S->begin(), K);
+    }
+    if (Reached || Waits.empty())
+      continue;
+    MachineSSAUpdater SSA(MF);
+    SSA.Initialize(Frag);
+    SSA.AddAvailableValue(GB, Frag);
+    for (auto [W, Direct] : Waits) {
+      Register V = Direct ? Frag : SSA.GetValueInMiddleOfBlock(W->getParent());
+      W->addOperand(MF, MachineOperand::CreateReg(V, /*isDef=*/false,
+                                                  /*isImp=*/true));
+    }
+  }
 }
 
 void SASSExpandWGMMA::expandSetMaxNReg(MachineInstr &MI) {
@@ -673,10 +828,64 @@ void SASSExpandWGMMA::expandSetMaxNReg(MachineInstr &MI) {
   MI.eraseFromParent();
 }
 
+/// Collects, operands first, the in-loop instructions to hoist out of \p L so
+/// that \p R is loop-invariant: pure single-def arithmetic on invariant
+/// operands whose only users are R2URs or \p User (so no GPR value starts to
+/// live across the loop). False when \p R cannot be made invariant.
+bool SASSExpandWGMMA::hoistableChain(Register R, const MachineLoop *L,
+                                     unsigned Depth, const MachineInstr *User,
+                                     SmallVectorImpl<MachineInstr *> &Chain) {
+  if (R.isPhysical())
+    return R == SASS::RZ || R == SASS::PT || R == SASS::URZ || R == SASS::UPT;
+  MachineInstr *D = nullptr;
+  for (MachineInstr &Def : MRI->def_instructions(R))
+    if (L->contains(Def.getParent())) {
+      if (D || !MRI->hasOneDef(R))
+        return false;
+      D = &Def;
+    }
+  if (!D || is_contained(Chain, D))
+    return true;
+  if (!Depth || D->isPHI() || D->isInlineAsm() || D->mayLoadOrStore() ||
+      D->hasUnmodeledSideEffects() || D->isConvergent() || D->isTerminator() ||
+      D->getNumExplicitDefs() != 1 || D->getNumImplicitOperands())
+    return false;
+  for (const MachineInstr &U : MRI->use_nodbg_instructions(R))
+    if (U.getOpcode() != SASS::R2UR && &U != User)
+      return false;
+  for (const MachineOperand &MO : D->uses())
+    if (MO.isReg() && MO.getReg() &&
+        !hoistableChain(MO.getReg(), L, Depth - 1, D, Chain))
+      return false;
+  Chain.push_back(D);
+  return true;
+}
+
+/// A descriptor half that does not change in a loop (the constant high word,
+/// a loop-invariant base) is moved to uniform registers in the preheader,
+/// with the GPR arithmetic only it uses, instead of occupying a GPR pair
+/// across the loop (spilled and reloaded every iteration under pressure).
+void SASSExpandWGMMA::hoistInvariantDescriptors(const MachineLoopInfo &MLI) {
+  for (MachineInstr *MI : DescR2URs) {
+    for (MachineLoop *L = MLI.getLoopFor(MI->getParent()); L;
+         L = L->getParentLoop()) {
+      MachineBasicBlock *PH = L->getLoopPreheader();
+      SmallVector<MachineInstr *, 4> Chain;
+      if (!PH || !hoistableChain(MI->getOperand(1).getReg(), L, 3, MI, Chain))
+        break;
+      Chain.push_back(MI);
+      for (MachineInstr *H : Chain)
+        H->moveBefore(&*PH->getFirstTerminator());
+    }
+  }
+}
+
 bool SASSExpandWGMMA::runOnMachineFunction(MachineFunction &MF) {
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget<SASSSubtarget>().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
+  DescR2URs.clear();
+  RSFrags.clear();
   SmallVector<MachineInstr *, 8> Work;
   for (MachineBasicBlock &B : MF)
     for (MachineInstr &MI : B)
@@ -692,6 +901,13 @@ bool SASSExpandWGMMA::runOnMachineFunction(MachineFunction &MF) {
       expandWGMMA(*MI);
     else
       expandSetMaxNReg(*MI);
+  }
+  if (LiveFrags)
+    extendFragments(MF);
+  if (HoistDesc && !DescR2URs.empty()) {
+    // (after the setmaxnreg retry loops are in the CFG)
+    MachineDominatorTree MDT(MF);
+    hoistInvariantDescriptors(MachineLoopInfo(MDT));
   }
   // Blocks where fewer registers than the function may use are available.
   auto *FI = MF.getInfo<SASSFunctionInfo>();
@@ -716,13 +932,49 @@ bool SASSExpandWGMMA::runOnMachineFunction(MachineFunction &MF) {
 
 namespace {
 
+/// Registers of in-flight GMMAs.
+struct GRegs {
+  /// Units of the accumulators and of the A fragments.
+  BitVector Acc, Src;
+  /// The accumulator tuples, sorted.
+  SmallVector<Register, 4> AccRegs;
+
+  explicit GRegs(unsigned NumUnits = 0) : Acc(NumUnits), Src(NumUnits) {}
+  bool operator==(const GRegs &O) const {
+    return Acc == O.Acc && Src == O.Src && AccRegs == O.AccRegs;
+  }
+  bool any() const { return Acc.any() || Src.any(); }
+  BitVector all() const {
+    BitVector A = Acc;
+    return A |= Src;
+  }
+  void reset() {
+    Acc.reset();
+    Src.reset();
+    AccRegs.clear();
+  }
+  void addAcc(Register R) {
+    auto It = lower_bound(AccRegs, R);
+    if (It == AccRegs.end() || *It != R)
+      AccRegs.insert(It, R);
+  }
+  GRegs &operator|=(const GRegs &O) {
+    Acc |= O.Acc;
+    Src |= O.Src;
+    for (Register R : O.AccRegs)
+      addAcc(R);
+    return *this;
+  }
+};
+
 /// GMMA register state at a program point.
 struct HState {
-  /// Register units of committed, unretired groups, oldest first.
-  SmallVector<BitVector, 8> Groups;
-  /// Units of GMMAs issued since the last gsb0 (not yet a group).
-  BitVector Open;
-  /// Units written by other instructions since the last WARPGROUP.ARRIVE.
+  /// Registers of committed, unretired groups, oldest first.
+  SmallVector<GRegs, 8> Groups;
+  /// Registers of GMMAs issued since the last gsb0 (not yet a group).
+  GRegs Open;
+  /// Units read or written by other instructions since the last
+  /// WARPGROUP.ARRIVE.
   BitVector Dirty;
   bool Valid = false;
 
@@ -740,15 +992,13 @@ struct HState {
     }
     if (O.Groups.size() > Groups.size())
       Groups.insert(Groups.begin(), O.Groups.size() - Groups.size(),
-                    BitVector(Open.size()));
+                    GRegs(Dirty.size()));
     for (unsigned I = 0, E = O.Groups.size(); I != E; ++I)
       Groups[Groups.size() - E + I] |= O.Groups[I];
     Open |= O.Open;
     Dirty |= O.Dirty;
   }
 };
-
-constexpr unsigned MaxGroups = 7; // DEPBAR.LE takes 0..7.
 
 class SASSWGMMAHazards : public MachineFunctionPass {
 public:
@@ -792,29 +1042,74 @@ static bool isConstReg(Register R) {
 
 HState SASSWGMMAHazards::process(MachineBasicBlock &MBB, HState S,
                                  bool Rewrite) {
+  // The last GMMA of this block not yet in a group. A hazard on the open
+  // group ends the group there (gsb0, then the full wait): every path
+  // executes it, and the waits after it count the same groups, the split
+  // one retired. Without one (the group began in a predecessor) every GMMA
+  // becomes its own group.
+  MachineInstr *LastOpen = nullptr;
+  auto CloseOpen = [&]() {
+    if (!LastOpen) {
+      NeedSerialize = true;
+      S.Open.reset();
+      return;
+    }
+    LastOpen->getOperand(gsbOperand(*LastOpen)).setImm(1);
+    LastOpen = nullptr;
+    S.Open.reset();
+  };
   for (MachineInstr &MI : make_early_inc_range(MBB)) {
     if (MI.isMetaInstruction())
       continue;
     unsigned Opc = MI.getOpcode();
     const DebugLoc &DL = MI.getDebugLoc();
     if (isGMMA(Opc)) {
-      BitVector Src(S.Open.size()), All(S.Open.size());
+      // The accumulator inputs are tied to the outputs.
+      Register D = MI.getOperand(0).getReg();
+      GRegs R(S.Dirty.size());
       bool RS = Opc == SASS::GMMA_RS || Opc == SASS::GMMA_RS_Z;
       if (RS)
-        addUnits(Src, MI.getOperand(2).getReg());
-      if (Opc == SASS::GMMA_SS || Opc == SASS::GMMA_RS)
-        addUnits(Src, MI.getOperand(RS ? 4 : 2).getReg());
-      if (Src.anyCommon(S.Dirty)) {
+        addUnits(R.Src, MI.getOperand(2).getReg());
+      addUnits(R.Acc, D);
+      R.addAcc(D);
+      BitVector All = R.all();
+      // In-flight GMMAs may share A fragments, and chain on one accumulator
+      // tuple (same shape, ordered by the hardware); a GMMA must not write
+      // another's A fragment (the next QK^T over a P*V still in flight),
+      // read an accumulator as its A fragment, or overlap another
+      // accumulator tuple. Wait for every group first.
+      auto Conflicts = [&](const GRegs &P) {
+        if (R.Src.anyCommon(P.Acc) || R.Acc.anyCommon(P.Src))
+          return true;
+        return R.Acc.anyCommon(P.Acc) &&
+               any_of(P.AccRegs, [&](Register A) {
+                 return A != D && TRI->regsOverlap(A, D);
+               });
+      };
+      bool OpenHazard = Conflicts(S.Open);
+      if (OpenHazard || any_of(S.Groups, Conflicts)) {
+        // DEPBAR does not wait for GMMAs outside a group.
+        if (OpenHazard)
+          CloseOpen();
+        if (Rewrite)
+          noGuard(BuildMI(MBB, MI, DL, TII->get(SASS::WARPGROUP_DEPBAR)).addImm(0));
+        S.Groups.clear();
+      }
+      // wgmma.fence orders every earlier access of the GMMA's registers,
+      // write-only accumulators (scale-d = 0) included: a register the
+      // allocator reused as a temporary after the source's fence corrupts
+      // the result unless the GMMA has its own arrive.
+      if (All.anyCommon(S.Dirty)) {
         if (Rewrite)
           noGuard(BuildMI(MBB, MI, DL, TII->get(SASS::WARPGROUP_ARRIVE)));
         S.Dirty.reset();
       }
-      All = Src;
-      addUnits(All, MI.getOperand(0).getReg());
-      S.Open |= All;
+      S.Open |= R;
+      LastOpen = &MI;
       if (MI.getOperand(gsbOperand(MI)).getImm()) {
         S.Groups.push_back(S.Open);
         S.Open.reset();
+        LastOpen = nullptr;
         if (S.Groups.size() > MaxGroups) {
           S.Groups[1] |= S.Groups[0];
           S.Groups.erase(S.Groups.begin());
@@ -832,34 +1127,32 @@ HState SASSWGMMAHazards::process(MachineBasicBlock &MBB, HState S,
         S.Groups.erase(S.Groups.begin(), S.Groups.end() - Keep);
       continue;
     }
-    BitVector Pending = S.Open;
-    for (const BitVector &G : S.Groups)
-      Pending |= G;
+    BitVector Pending = S.Open.all();
+    for (const GRegs &G : S.Groups)
+      Pending |= G.all();
+    BitVector Open = S.Open.all();
     bool Exit = MI.isReturn() || MI.isCall();
     bool Touch = Exit && Pending.any(), TouchOpen = Exit && S.Open.any();
-    BitVector Defs(S.Open.size());
+    BitVector Accessed(S.Dirty.size());
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg() || !MO.getReg() || !MO.getReg().isPhysical() ||
           isConstReg(MO.getReg()))
         continue;
       for (MCRegUnit U : TRI->regunits(MO.getReg())) {
         Touch |= Pending.test(static_cast<unsigned>(U));
-        TouchOpen |= S.Open.test(static_cast<unsigned>(U));
-        if (MO.isDef())
-          Defs.set(static_cast<unsigned>(U));
+        TouchOpen |= Open.test(static_cast<unsigned>(U));
+        Accessed.set(static_cast<unsigned>(U));
       }
     }
     if (Touch) {
       // DEPBAR does not wait for GMMAs outside a group.
-      if (TouchOpen) {
-        NeedSerialize = true;
-        S.Open.reset();
-      }
+      if (TouchOpen)
+        CloseOpen();
       if (Rewrite)
         noGuard(BuildMI(MBB, MI, DL, TII->get(SASS::WARPGROUP_DEPBAR)).addImm(0));
       S.Groups.clear();
     }
-    S.Dirty |= Defs;
+    S.Dirty |= Accessed;
   }
   return S;
 }
@@ -916,6 +1209,10 @@ bool SASSWGMMAHazards::runOnMachineFunction(MachineFunction &MF) {
         Last = nullptr;
         MI.eraseFromParent();
         Any = true;
+      } else if (MI.getOpcode() == SASS::WARPGROUP_DEPBAR) {
+        // The A fragment uses from SASSExpandWGMMA served the allocator.
+        while (MI.getNumOperands() > MI.getNumExplicitOperands())
+          MI.removeOperand(MI.getNumOperands() - 1);
       }
     }
   }
@@ -944,7 +1241,7 @@ bool SASSWGMMAHazards::runOnMachineFunction(MachineFunction &MF) {
         HState Entry;
         if (B == &MF.front()) {
           Entry.Valid = true;
-          Entry.Open.resize(NumUnits);
+          Entry.Open = GRegs(NumUnits);
           Entry.Dirty.resize(NumUnits);
         }
         for (MachineBasicBlock *P : B->predecessors())

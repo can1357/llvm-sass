@@ -187,6 +187,9 @@ void SASSAsmPrinter::emitInstruction(const MachineInstr *MI) {
       MF->getDenormalMode(APFloat::IEEEsingle()).Output ==
           DenormalMode::PreserveSign)
     Inst.setFlags(SASS::InstFlagFTZ);
+  if (MI->mayLoad() && MI->hasOneMemOperand())
+    Inst.setFlags(Inst.getFlags() | SASS::loadHintOfMMOFlags(
+                                        (*MI->memoperands_begin())->getFlags()));
   Printer->printInst(&Inst, 0, "", getSubtargetInfo(), OS);
   OS << ";[" << C.Wr << ':' << C.Rd << ":{";
   bool First = true;

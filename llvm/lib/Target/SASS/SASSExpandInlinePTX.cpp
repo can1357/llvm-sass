@@ -11,8 +11,11 @@
 //   arithmetic, setp/selp/cvt/prmt/lop3, ld/st with state spaces, orderings
 //   and vectors, atom/red, fences and barriers, mbarrier, bulk and tensor
 //   copies, cluster barriers, special registers, ...) are emitted directly.
-//   Cache hints (.L1::*, .L2::*, createpolicy) are performance hints and are
-//   dropped.
+//   L2 cache policies are kept: createpolicy.fractional computes ptxas's
+//   policy word, ld/st with .L2::cache_hint become SASS::L2HintLoadFn/
+//   L2HintStoreFn calls (LDG/STG desc[policy]) and bulk/tensor copies pass
+//   the policy to their intrinsics; ld's .L1::no_allocate and .L2::<size>
+//   become LDG modifiers. Other cache hints are dropped.
 // * The instructions SASSLowerInlinePTX implements (ldmatrix, stmatrix,
 //   mma.sync.m16n8k16, cp.async, ex2/rcp.approx.ftz) are re-emitted as
 //   single-instruction asm calls for that pass. mma.sync.m16n8k32 on FP8
@@ -25,7 +28,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "MCTargetDesc/SASSBaseInfo.h"
 #include "SASS.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -722,6 +727,10 @@ private:
   bool emitCompare(const Stmt &S);
   bool emitConvert(const Stmt &S);
   bool emitMemory(const Stmt &S);
+  /// ld/st (global or generic, unordered) with an L2 cache policy \p Pol:
+  /// a call to SASS::L2HintLoadFn/L2HintStoreFn on the access's 32-bit words.
+  void emitPolicyAccess(const Stmt &S, bool Load, Value *P, const Opnd &Val, PTy T, unsigned N,
+                        Value *Pol);
   bool emitAtomic(const Stmt &S);
   bool emitSync(const Stmt &S);
   bool emitMBarrier(const Stmt &S);
@@ -1502,6 +1511,12 @@ bool PTXProgram::emitMemory(const Stmt &S) {
   if (Ord && N > 1)
     fail("ordered vector accesses are not supported");
   bool Volatile = S.has("volatile") || S.has("mmio");
+  // An L2 policy on an ordered or volatile access is dropped (no STRONG
+  // desc[] forms here).
+  if (HasHint && (AS == 0 || AS == 1) && !Ord && !Volatile) {
+    emitPolicyAccess(S, Load, P, Val, T, N, read(S.Ops[2], 64));
+    return true;
+  }
   // CTA-scope ordering on shared memory: the shared memory pipe keeps a
   // thread's accesses in order, so (as ptxas) a release store only needs a
   // CTA membar before it and an acquire load nothing; compiler ordering
@@ -1524,6 +1539,17 @@ bool PTXProgram::emitMemory(const Stmt &S) {
       L->setAtomic(*Ord, scope(S));
     if ((S.has("nc") || S.Root == "ldu") && !Ord && !Volatile)
       L->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(Ctx, {}));
+    // L1 no-allocate and the L2 prefetch size become LDG.E.NA.LTC256B...,
+    // as ptxas emits them (streamed weights: ~10% of a bs=1 MoE kernel).
+    unsigned Hint = S.has("L1::no_allocate") ? SASS::InstFlagNA : 0;
+    if (unsigned LTC = S.has("L2::64B")    ? 1
+                       : S.has("L2::128B") ? 2
+                       : S.has("L2::256B") ? 3
+                                           : 0)
+      Hint |= LTC << SASS::InstFlagLTCShift;
+    if (Hint)
+      L->setMetadata(SASS::LoadHintMD,
+                     MDNode::get(Ctx, ConstantAsMetadata::get(B.getInt32(Hint))));
     if (N == 1) {
       write(Val, L, T);
     } else {
@@ -1544,6 +1570,74 @@ bool PTXProgram::emitMemory(const Stmt &S) {
   if (Ord)
     St->setAtomic(*Ord, scope(S));
   return true;
+}
+
+void PTXProgram::emitPolicyAccess(const Stmt &S, bool Load, Value *P, const Opnd &Val, PTy T,
+                                  unsigned N, Value *Pol) {
+  unsigned EB = T.Bits, Bytes = EB * N / 8;
+  if (Bytes != 1 && Bytes != 2 && Bytes != 4 && Bytes != 8 && Bytes != 16)
+    unsupported(S);
+  unsigned Words = std::max(1u, Bytes / 4), PerWord = std::max(1u, 32 / EB);
+  unsigned AS = P->getType()->getPointerAddressSpace();
+  std::string Name = (Twine(Load ? SASS::L2HintLoadFn : SASS::L2HintStoreFn) + "." +
+                      Twine(Bytes) + ".p" + Twine(AS))
+                         .str();
+  Type *I32 = B.getInt32Ty();
+  auto Elt = [&](unsigned I) -> const Opnd & { return N == 1 ? Val : Val.Elts[I]; };
+  auto Callee = [&](Type *Ret, ArrayRef<Type *> Params) {
+    FunctionCallee FC = M.getOrInsertFunction(Name, FunctionType::get(Ret, Params, false));
+    auto *Fn = cast<Function>(FC.getCallee());
+    Fn->addFnAttr(Attribute::NoUnwind);
+    Fn->addFnAttr(Attribute::WillReturn);
+    Fn->setMemoryEffects(MemoryEffects::argMemOnly(Load ? ModRefInfo::Ref : ModRefInfo::Mod));
+    Fn->addParamAttr(0, Attribute::getWithCaptureInfo(Ctx, CaptureInfo::none()));
+    return FC;
+  };
+  if (Load) {
+    // Bit 0: non-coherent; bits 1-3: the L1/L2 qualifiers (as LoadHintMD).
+    unsigned Flags = (S.has("nc") || S.Root == "ldu") ? 1 : 0;
+    if (S.has("L1::no_allocate"))
+      Flags |= SASS::InstFlagNA;
+    if (unsigned LTC = S.has("L2::64B")    ? 1
+                       : S.has("L2::128B") ? 2
+                       : S.has("L2::256B") ? 3
+                                           : 0)
+      Flags |= LTC << SASS::InstFlagLTCShift;
+    Type *Ret = Words == 1 ? I32 : StructType::get(Ctx, SmallVector<Type *, 4>(Words, I32));
+    CallInst *C = B.CreateCall(Callee(Ret, {P->getType(), B.getInt64Ty(), I32}),
+                               {P, Pol, B.getInt32(Flags)});
+    SmallVector<Value *, 4> W;
+    for (unsigned I = 0; I < Words; ++I)
+      W.push_back(Words == 1 ? (Value *)C : B.CreateExtractValue(C, I));
+    for (unsigned I = 0; I < N; ++I) {
+      Value *E;
+      if (EB >= 32) {
+        E = B.CreateZExt(W[I * EB / 32], intTy(EB));
+        for (unsigned K = 1; K < EB / 32; ++K)
+          E = B.CreateOr(E, B.CreateShl(B.CreateZExt(W[I * EB / 32 + K], intTy(EB)), 32 * K));
+      } else {
+        E = B.CreateTrunc(B.CreateLShr(W[I / PerWord], (I % PerWord) * EB), intTy(EB));
+      }
+      write(Elt(I), E, T);
+    }
+    return;
+  }
+  SmallVector<Value *, 6> Args = {P, Pol};
+  for (unsigned Wd = 0; Wd < Words; ++Wd) {
+    Value *V;
+    if (EB >= 32) {
+      Value *E = read(Elt(Wd * 32 / EB), EB, T);
+      V = B.CreateTrunc(B.CreateLShr(E, (Wd % (EB / 32)) * 32), I32);
+    } else {
+      V = B.getInt32(0);
+      for (unsigned I = Wd * PerWord; I < std::min(N, (Wd + 1) * PerWord); ++I)
+        V = B.CreateOr(V, B.CreateShl(B.CreateZExt(read(Elt(I), EB, T), I32), (I % PerWord) * EB));
+    }
+    Args.push_back(V);
+  }
+  SmallVector<Type *, 6> Params = {P->getType(), B.getInt64Ty()};
+  Params.append(Words, I32);
+  B.CreateCall(Callee(B.getVoidTy(), Params), Args);
 }
 
 bool PTXProgram::emitAtomic(const Stmt &S) {
@@ -1607,13 +1701,23 @@ bool PTXProgram::emitAtomic(const Stmt &S) {
   unsigned ESize = DL.getTypeStoreSize(ET);
   const Opnd &Val = S.Ops[First + 1];
   if (N > 1) {
-    // .v2/.v4 reductions are atomic per element.
-    if (Val.K != Opnd::Vec || Val.Elts.size() != N || !Red)
+    // .v2/.v4 operations are atomic per element. The first element carries
+    // the vector's alignment, so SASSPipeBalance can rejoin them into one
+    // vector ATOMG/REDG (.F32x2/.F32x4, .F16x4/.F16x8, .BF16x4/.BF16x8).
+    const Opnd *Dst = Red ? nullptr : &S.Ops[0];
+    if (Val.K != Opnd::Vec || Val.Elts.size() != N ||
+        (Dst && (Dst->K != Opnd::Vec || Dst->Elts.size() != N)))
       unsupported(S);
     for (unsigned I = 0; I < N; ++I) {
       Value *EP = B.CreateConstGEP1_64(B.getInt8Ty(), P, I * ESize);
       Value *V = FP ? readF(Val.Elts[I], ET, T) : read(Val.Elts[I], T.Bits, T);
-      B.CreateAtomicRMW(BO, EP, V, Align(ESize), Ord, SSID);
+      Value *R = B.CreateAtomicRMW(BO, EP, V, Align(I ? ESize : N * ESize), Ord, SSID);
+      if (Dst) {
+        if (FP)
+          writeF(Dst->Elts[I], R);
+        else
+          write(Dst->Elts[I], R, T);
+      }
     }
     return true;
   }
@@ -1844,8 +1948,9 @@ bool PTXProgram::emitBulk(const Stmt &S) {
     return false;
   bool Hint = S.has("L2::cache_hint");
   bool Multicast = S.has("multicast::cluster");
-  Value *NoHint = B.getInt64(0);
   auto Flag = [&](bool F) { return B.getInt1(F); };
+  // The L2 cache policy operand \p I (.L2::cache_hint), else 0.
+  auto Policy = [&](unsigned I) { return Hint ? read(S.Ops[I], 64) : B.getInt64(0); };
   if (S.has("commit_group")) {
     call(Intrinsic::nvvm_cp_async_bulk_commit_group, {});
     return true;
@@ -1858,7 +1963,6 @@ bool PTXProgram::emitBulk(const Stmt &S) {
          {B.getInt32(N)});
     return true;
   }
-  // Cache hints are dropped (they only tune L2 residency).
   if (S.has("tensor")) {
     unsigned Dim = 0;
     for (StringRef Mo : S.Mods)
@@ -1886,8 +1990,8 @@ bool PTXProgram::emitBulk(const Stmt &S) {
       SmallVector<Value *, 12> Args = {address(S.Ops[0], 7), address(S.Ops[2], 3)};
       Coords(S.Ops[1], Args);
       Args.push_back(Multicast ? read(S.Ops[3], 16) : B.getInt16(0));
-      Args.push_back(NoHint);
-      Args.append({Flag(Multicast), Flag(false), B.getInt32(0)});
+      Args.push_back(Policy(3 + Multicast));
+      Args.append({Flag(Multicast), Flag(Hint), B.getInt32(0)});
       call(nvvm("cp_async_bulk_tensor_g2s_tile_" + std::to_string(Dim) + "d"), Args);
       return true;
     }
@@ -1896,8 +2000,8 @@ bool PTXProgram::emitBulk(const Stmt &S) {
       need(S, 2 + Hint);
       SmallVector<Value *, 8> Args = {address(S.Ops[1], 3)};
       Coords(S.Ops[0], Args);
-      Args.push_back(NoHint);
-      Args.push_back(Flag(false));
+      Args.push_back(Policy(2));
+      Args.push_back(Flag(Hint));
       call(nvvm("cp_async_bulk_tensor_s2g_tile_" + std::to_string(Dim) + "d"), Args);
       return true;
     }
@@ -1907,7 +2011,7 @@ bool PTXProgram::emitBulk(const Stmt &S) {
     // cp.async.bulk.prefetch.L2.global[.L2::cache_hint] [a], size[, hint]
     need(S, 2 + Hint);
     call(Intrinsic::nvvm_cp_async_bulk_prefetch_L2,
-         {address(S.Ops[0], 1), read(S.Ops[1], 32), NoHint, Flag(false)});
+         {address(S.Ops[0], 1), read(S.Ops[1], 32), Policy(2), Flag(Hint)});
     return true;
   }
   // Destination and source spaces follow "bulk".
@@ -1919,18 +2023,19 @@ bool PTXProgram::emitBulk(const Stmt &S) {
     if (Dst == "shared" && !Multicast) {
       call(Intrinsic::nvvm_cp_async_bulk_global_to_shared_cta,
            {address(S.Ops[0], 3), address(S.Ops[3], 3), address(S.Ops[1], 1),
-            read(S.Ops[2], 32), NoHint, Flag(false)});
+            read(S.Ops[2], 32), Policy(4), Flag(Hint)});
       return true;
     }
     call(Intrinsic::nvvm_cp_async_bulk_global_to_shared_cluster,
          {address(S.Ops[0], 7), address(S.Ops[3], 3), address(S.Ops[1], 1), read(S.Ops[2], 32),
-          Multicast ? read(S.Ops[4], 16) : B.getInt16(0), NoHint, Flag(Multicast), Flag(false)});
+          Multicast ? read(S.Ops[4], 16) : B.getInt16(0), Policy(4 + Multicast), Flag(Multicast),
+          Flag(Hint)});
     return true;
   }
   if (Dst == "global" && Src == "shared") {
     need(S, 3 + Hint);
     call(Intrinsic::nvvm_cp_async_bulk_shared_cta_to_global,
-         {address(S.Ops[0], 1), address(S.Ops[1], 3), read(S.Ops[2], 32), NoHint, Flag(false)});
+         {address(S.Ops[0], 1), address(S.Ops[1], 3), read(S.Ops[2], 32), Policy(3), Flag(Hint)});
     return true;
   }
   if (Dst == "shared::cluster" && Src == "shared") {
@@ -2081,7 +2186,8 @@ bool PTXProgram::emitMatrix(const Stmt &S) {
   }
   // m16n8k32 FP8 (sm_89 PTX): sm_90 has no FP8 mma.sync. Each A/B register
   // holds four FP8 values; converting its low and high pairs to f16x2 gives
-  // the fragments of two k16 MMAs over the k-halves, accumulated in order.
+  // the fragments of two k16 MMAs over the k-halves, accumulated in order
+  // from zero; C is added last (FADD), as ptxas does, for its rounding.
   if (Shape == "m16n8k32" && S.Mods.size() == 9 && S.Mods[3] == "row" && S.Mods[4] == "col" &&
       S.Mods[5] == "f32" && S.Mods[8] == "f32" &&
       (S.Mods[6] == "e4m3" || S.Mods[6] == "e5m2") &&
@@ -2111,10 +2217,13 @@ bool PTXProgram::emitMatrix(const Stmt &S) {
       O.Name = N;
       return O;
     };
-    Opnd D1;
-    D1.K = Opnd::Vec;
-    for (unsigned I = 0; I < 4; ++I)
+    Opnd Z, D1, D2;
+    Z.K = D1.K = D2.K = Opnd::Vec;
+    for (unsigned I = 0; I < 4; ++I) {
+      Z.Elts.push_back(Temp(B.getInt32(0)));
       D1.Elts.push_back(Temp(B.getInt32(0)));
+      D2.Elts.push_back(Temp(B.getInt32(0)));
+    }
     for (bool Hi : {false, true}) {
       Stmt Half;
       Half.Opc = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32";
@@ -2126,9 +2235,13 @@ bool PTXProgram::emitMatrix(const Stmt &S) {
         Av.Elts.push_back(Temp(Unpack(E, S.Mods[6], Hi)));
       for (const Opnd &E : Bo.Elts)
         Bv.Elts.push_back(Temp(Unpack(E, S.Mods[7], Hi)));
-      Half.Ops = {Hi ? D : D1, Av, Bv, Hi ? D1 : C};
+      Half.Ops = {Hi ? D2 : D1, Av, Bv, Hi ? D1 : Z};
       emitLeaf(Half, {Out, In, In, In}, {'f', 'r', 'r', 'f'});
     }
+    const PTy F32{'f', 32};
+    for (unsigned I = 0; I < 4; ++I)
+      writeF(D.Elts[I], B.CreateFAdd(readF(D2.Elts[I], B.getFloatTy(), F32),
+                                     readF(C.Elts[I], B.getFloatTy(), F32)));
     return true;
   }
   unsupported(S);
@@ -2195,8 +2308,48 @@ bool PTXProgram::emitMisc(const Stmt &S) {
     return true;
   }
   if (R == "createpolicy") {
-    // Policies only feed .L2::cache_hint operands, which are dropped.
-    write(S.Ops[0], B.getInt64(0));
+    // createpolicy.fractional.L2::<primary>[.L2::<secondary>].b64 p[, f]
+    // as ptxas computes it: bit 60, the primary priority in bits 57-58
+    // (evict_unchanged 0, evict_first 1, evict_last 2, evict_normal 3), a
+    // secondary evict_first in bit 56 and the fraction (default 1.0) as
+    // F2I.U32.TRUNC(f * 15.99) in bits 52-55; the low word is 0.
+    if (!S.has("fractional"))
+      unsupported(S);
+    need(S, S.Ops.size() > 1 ? 2 : 1);
+    SmallVector<StringRef, 2> Pri;
+    for (const std::string &Mo : S.Mods)
+      if (StringRef(Mo).starts_with("L2::evict_"))
+        Pri.push_back(StringRef(Mo).drop_front(strlen("L2::evict_")));
+    auto Code = [&](StringRef P) {
+      int C = StringSwitch<int>(P)
+                  .Case("unchanged", 0)
+                  .Case("first", 1)
+                  .Case("last", 2)
+                  .Case("normal", 3)
+                  .Default(-1);
+      if (C < 0)
+        unsupported(S);
+      return uint64_t(C);
+    };
+    if (Pri.empty() || Pri.size() > 2 || (Pri.size() == 2 && Code(Pri[1]) > 1))
+      unsupported(S);
+    uint64_t Hi = 0x100 | Code(Pri[0]) << 5 | (Pri.size() == 2 ? Code(Pri[1]) : 0) << 4;
+    const PTy F32{'f', 32};
+    Value *Frac = S.Ops.size() > 1 ? read(S.Ops[1], 32, F32) : B.getInt32(0x3f800000);
+    if (auto *C = dyn_cast<ConstantInt>(Frac)) {
+      APFloat X(APFloat::IEEEsingle(), C->getValue());
+      X.multiply(APFloat(15.99f), APFloat::rmNearestTiesToEven);
+      APSInt Q(32, /*isUnsigned=*/true);
+      bool Exact;
+      X.convertToInteger(Q, APFloat::rmTowardZero, &Exact); // saturates; NaN -> 0
+      write(S.Ops[0], B.getInt64((Hi | (Q.getZExtValue() & 0xf)) << 52));
+      return true;
+    }
+    Value *X = B.CreateFMul(B.CreateBitCast(Frac, B.getFloatTy()),
+                            ConstantFP::get(B.getFloatTy(), 15.99f));
+    Value *Q = call(Intrinsic::fptoui_sat, {X}, {B.getInt32Ty(), B.getFloatTy()});
+    Q = B.CreateOr(B.CreateAnd(Q, 0xf), B.getInt32(Hi));
+    write(S.Ops[0], B.CreateShl(B.CreateZExt(Q, B.getInt64Ty()), 52));
     return true;
   }
   if (R == "discard" || R == "applypriority")
@@ -2259,6 +2412,58 @@ static std::string expandAsm(StringRef Asm, unsigned Uid) {
   return Out;
 }
 
+/// Hopper, as ptxas: the first poll of a spin loop `W: p = try_wait(..);
+/// br p, Exit, W` runs at the end of its predecessor, which branches to the
+/// loop only when it fails (unlikely, so the retry is placed out of line).
+/// The poll then shares a block with the preceding code and the scheduler
+/// overlaps it with independent work.
+static bool peelPolls(Function &F) {
+  StringRef CPU = F.getFnAttribute("target-cpu").getValueAsString();
+  if (!CPU.starts_with("sm_90"))
+    return false;
+  SmallVector<BasicBlock *, 8> Spins;
+  for (BasicBlock &B : F) {
+    auto *Br = dyn_cast<BranchInst>(B.getTerminator());
+    auto *Poll = dyn_cast<IntrinsicInst>(&B.front());
+    if (!Br || !Br->isConditional() || !Poll || Br->getCondition() != Poll ||
+        Poll->getNextNode() != Br || !Poll->hasOneUse() ||
+        (Br->getSuccessor(0) != &B) == (Br->getSuccessor(1) != &B))
+      continue;
+    StringRef Name = Poll->getCalledFunction()->getName();
+    if (Name.starts_with("llvm.nvvm.mbarrier.try.wait") ||
+        Name.starts_with("llvm.nvvm.mbarrier.test.wait"))
+      Spins.push_back(&B);
+  }
+  bool Changed = false;
+  for (BasicBlock *B : Spins) {
+    BasicBlock *P = nullptr;
+    unsigned NPreds = 0;
+    for (BasicBlock *Pred : predecessors(B))
+      if (Pred != B) {
+        P = Pred;
+        ++NPreds;
+      }
+    auto *PBr = P ? dyn_cast<BranchInst>(P->getTerminator()) : nullptr;
+    if (NPreds != 1 || !PBr || PBr->isConditional())
+      continue;
+    auto *Br = cast<BranchInst>(B->getTerminator());
+    unsigned ExitIdx = Br->getSuccessor(0) == B ? 1 : 0;
+    BasicBlock *Exit = Br->getSuccessor(ExitIdx);
+    Instruction *First = B->front().clone();
+    First->insertBefore(PBr->getIterator());
+    BranchInst *NB = BranchInst::Create(Br->getSuccessor(0), Br->getSuccessor(1), First,
+                                        PBr->getIterator());
+    MDBuilder MDB(F.getContext());
+    NB->setMetadata(LLVMContext::MD_prof, ExitIdx == 0 ? MDB.createLikelyBranchWeights()
+                                                       : MDB.createUnlikelyBranchWeights());
+    PBr->eraseFromParent();
+    for (PHINode &PN : Exit->phis())
+      PN.addIncoming(PN.getIncomingValueForBlock(B), P);
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool SASSExpandInlinePTX::runOnFunction(Function &F) {
   SmallVector<CallInst *, 16> Calls;
   for (Instruction &I : instructions(F))
@@ -2317,6 +2522,7 @@ bool SASSExpandInlinePTX::runOnFunction(Function &F) {
       if (!is_contained(Live, A))
         report_fatal_error("SASS: inline PTX in " + F.getName() +
                            ": a register could not be promoted");
+    peelPolls(F);
   }
   return Changed;
 }

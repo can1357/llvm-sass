@@ -6,9 +6,15 @@
 #include "SASSSubtarget.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
+
+static cl::opt<bool>
+    RematALU("sass-remat-alu", cl::init(true), cl::Hidden,
+             cl::desc("Rematerialize cheap integer ALU defs instead of "
+                      "spilling them (sm_90)"));
 
 #define GET_INSTRINFO_CTOR_DTOR
 #include "SASSGenInstrInfo.inc"
@@ -50,6 +56,21 @@ void SASSInstrInfo::copyPhysReg(MachineBasicBlock &MBB,
     return Copy(SASS::R2UR, Dst, Src, KillSrc);
   if (SASS::GPR32RegClass.contains(Dst) && SASS::UGPR32RegClass.contains(Src))
     return Copy(SASS::MOVru, Dst, Src, KillSrc);
+  // Uniform pairs (SASSUniformRegs) to and from uniform or vector pairs.
+  bool UDst = SASS::UGPR64RegClass.contains(Dst),
+       USrc = SASS::UGPR64RegClass.contains(Src);
+  if ((UDst || USrc) && (UDst || SASS::GPR64RegClass.contains(Dst)) &&
+      (USrc || SASS::GPR64RegClass.contains(Src))) {
+    unsigned Opc = UDst ? (USrc ? SASS::UMOV : SASS::R2UR) : SASS::MOVru;
+    // Halves in the order that does not clobber an overlapping source.
+    bool Down = RI.getEncodingValue(Dst) > RI.getEncodingValue(Src) &&
+                UDst == USrc;
+    unsigned First = Down ? SASS::sub1 : SASS::sub0;
+    unsigned Second = Down ? SASS::sub0 : SASS::sub1;
+    for (unsigned Idx : {First, Second})
+      Copy(Opc, RI.getSubReg(Dst, Idx), RI.getSubReg(Src, Idx), KillSrc);
+    return;
+  }
   if (SASS::PREDRegClass.contains(Dst, Src)) {
     noGuard(BuildMI(MBB, I, DL, get(SASS::PMOV), Dst)
                 .addReg(Src, getKillRegState(KillSrc))
@@ -102,15 +123,42 @@ void SASSInstrInfo::expandAdd64(MachineInstr &MI) const {
   Register Lo = MRI.createVirtualRegister(&SASS::GPR32RegClass);
   Register Hi = MRI.createVirtualRegister(&SASS::GPR32RegClass);
   Register Carry = MRI.createVirtualRegister(&SASS::PREDRegClass);
+  // A zero-extended operand's high word (zext: REG_SEQUENCE lo, (MOV 0)) is
+  // read as RZ on Hopper, so no register holds the zero (an address plus a
+  // 32-bit offset otherwise keeps one live, or spilled, across a loop).
+  bool ZeroHi =
+      !MBB.getParent()->getSubtarget<SASSSubtarget>().hasBlackwellISA();
+  auto HiOf = [&](Register R) -> Register {
+    const MachineInstr *D = ZeroHi ? MRI.getVRegDef(R) : nullptr;
+    if (!D || !D->isRegSequence())
+      return Register();
+    for (unsigned I = 1, E = D->getNumOperands(); I + 1 < E; I += 2) {
+      if (D->getOperand(I + 1).getImm() != SASS::sub1)
+        continue;
+      const MachineOperand &S = D->getOperand(I);
+      const MachineInstr *Z = S.getSubReg() ? nullptr : MRI.getVRegDef(S.getReg());
+      if (Z && Z->getOpcode() == SASS::MOVri && Z->getOperand(1).isImm() &&
+          Z->getOperand(1).getImm() == 0 && !isPredicated(*Z))
+        return SASS::RZ;
+    }
+    return Register();
+  };
   auto L = BuildMI(MBB, MI, DL, get(LoOpc), Lo).addDef(Carry).addReg(A, {}, SASS::sub0);
-  auto H = BuildMI(MBB, MI, DL, get(HiOpc), Hi).addReg(A, {}, SASS::sub1);
+  auto H = BuildMI(MBB, MI, DL, get(HiOpc), Hi);
+  if (Register Z = HiOf(A))
+    H.addReg(Z);
+  else
+    H.addReg(A, {}, SASS::sub1);
   if (B.isImm()) {
     // The immediate is sign-extended: its high word is 0 or -1.
     L.addImm(B.getImm());
     H.addImm(B.getImm() < 0 ? -1 : 0);
   } else {
     L.addReg(B.getReg(), {}, SASS::sub0);
-    H.addReg(B.getReg(), {}, SASS::sub1);
+    if (Register Z = HiOf(B.getReg()))
+      H.addReg(Z);
+    else
+      H.addReg(B.getReg(), {}, SASS::sub1);
   }
   noGuard(L);
   noGuard(H.addReg(Carry));
@@ -212,6 +260,25 @@ Register SASSInstrInfo::isLoadFromStackSlot(const MachineInstr &MI,
 Register SASSInstrInfo::isStoreToStackSlot(const MachineInstr &MI,
                                            int &FrameIndex) const {
   return stackSlotAccess(MI, true, FrameIndex);
+}
+
+/// INIT_UNDEF (InitUndef's def of an undefined register that an early-clobber
+/// instruction reads, e.g. the unused A half of an RS-form wgmma's descriptor
+/// quad) emits nothing, but is no meta instruction: SASSControlCodes would
+/// give it an issue slot and park the next instruction's wait in its stall,
+/// which is never printed (an HGMMA then read UR2:UR3 one cycle after their
+/// R2UR). After allocation it is just an IMPLICIT_DEF.
+/// FAKE_USE (SASSPreRASched's hold on an HMMA's unread result lanes) has
+/// done its work once registers are assigned.
+bool SASSInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+  if (MI.isFakeUse()) {
+    MI.eraseFromParent();
+    return true;
+  }
+  if (MI.getOpcode() != TargetOpcode::INIT_UNDEF)
+    return false;
+  MI.setDesc(get(TargetOpcode::IMPLICIT_DEF));
+  return true;
 }
 
 static bool isUncondBranch(unsigned Opc) { return Opc == SASS::BRA; }
@@ -385,16 +452,29 @@ bool SASSInstrInfo::ClobbersPredicate(MachineInstr &MI,
 
 // Predication saves a branch (min. stall 5) plus the 13-14 cycle
 // predicate-to-branch latency; short blocks are always worth it.
-bool SASSInstrInfo::isProfitableToIfCvt(MachineBasicBlock &, unsigned NumCycles,
-                                        unsigned, BranchProbability) const {
-  return NumCycles <= 12;
+// On sm_90 the size is the instruction count: IfConverter adds each
+// instruction's latency, which kept short guarded shared loads (a producer's
+// page indices, ~25 cycles of BSSY/branch/BSYNC each) as branches.
+static unsigned ifcvtSize(const MachineBasicBlock &MBB, unsigned NumCycles) {
+  if (MBB.getParent()->getSubtarget<SASSSubtarget>().hasBlackwellISA())
+    return NumCycles;
+  unsigned N = 0;
+  for (const MachineInstr &MI : MBB)
+    N += !MI.isMetaInstruction() && !MI.isTerminator();
+  return N;
 }
 
-bool SASSInstrInfo::isProfitableToIfCvt(MachineBasicBlock &, unsigned NumT,
-                                        unsigned, MachineBasicBlock &,
+bool SASSInstrInfo::isProfitableToIfCvt(MachineBasicBlock &MBB,
+                                        unsigned NumCycles, unsigned,
+                                        BranchProbability) const {
+  return ifcvtSize(MBB, NumCycles) <= 12;
+}
+
+bool SASSInstrInfo::isProfitableToIfCvt(MachineBasicBlock &TMBB, unsigned NumT,
+                                        unsigned, MachineBasicBlock &FMBB,
                                         unsigned NumF, unsigned,
                                         BranchProbability) const {
-  return NumT + NumF <= 16;
+  return ifcvtSize(TMBB, NumT) + ifcvtSize(FMBB, NumF) <= 16;
 }
 
 bool SASSInstrInfo::isProfitableToDupForIfCvt(MachineBasicBlock &,
@@ -405,4 +485,216 @@ bool SASSInstrInfo::isProfitableToDupForIfCvt(MachineBasicBlock &,
 
 bool SASSInstrInfo::isHighLatencyDef(int Opc) const {
   return SASS::writesSB(get(Opc));
+}
+
+/// \p MI's block heads a triangle `MBB -> T -> J, MBB -> J` (an `if` without
+/// `else`) and nothing in T reads \p MI: MachineSink can only move it into J,
+/// which post-dominates the block, so no path skips it. With \p Poll, T may
+/// instead be a self-loop L entered only from the block, possibly through a
+/// preheader (a peeled mbarrier poll, `MBB -> [T ->] L -> L|J, MBB -> J`):
+/// sinking only delays \p MI past the wait.
+static bool sinksOnlyIntoJoin(const MachineInstr &MI, bool Poll = false) {
+  const MachineBasicBlock *MBB = MI.getParent();
+  if (MBB->succ_size() != 2)
+    return false;
+  const MachineBasicBlock *S0 = *MBB->succ_begin(),
+                          *S1 = *std::next(MBB->succ_begin());
+  auto PollLoop = [&](const MachineBasicBlock *L, const MachineBasicBlock *Pre,
+                      const MachineBasicBlock *J) {
+    return L != J && L->pred_size() == 2 && L->succ_size() == 2 &&
+           L->isSuccessor(L) && L->isSuccessor(J) && L->isPredecessor(Pre);
+  };
+  for (auto [T, J] : {std::pair(S0, S1), std::pair(S1, S0)}) {
+    const MachineBasicBlock *L = nullptr;
+    if (T->pred_size() == 1 && T->succ_size() == 1 && *T->succ_begin() == J)
+      ; // Triangle.
+    else if (Poll && PollLoop(T, MBB, J))
+      L = T;
+    else if (Poll && T->pred_size() == 1 && T->succ_size() == 1 &&
+             PollLoop(*T->succ_begin(), T, J))
+      L = *T->succ_begin();
+    else
+      continue;
+    const MachineRegisterInfo &MRI = MBB->getParent()->getRegInfo();
+    for (const MachineOperand &MO : MI.defs())
+      if (MO.getReg().isVirtual())
+        for (const MachineInstr &U : MRI.use_nodbg_instructions(MO.getReg()))
+          if (U.getParent() == T || U.getParent() == L ||
+              (U.isPHI() && U.getParent() == J))
+            return false;
+    return true;
+  }
+  return false;
+}
+
+// Uniform registers are one per warp: they are written only where the warp
+// runs converged (SASSUniformRegs; SASSReconverge checks the final code).
+// Sinking a uniform write into a successor may put it below a divergent
+// branch.
+static bool writesUniform(const MachineInstr &MI) {
+  const MachineFunction &MF = *MI.getMF();
+  if (!SASS::reconverges(MF.getSubtarget<SASSSubtarget>()))
+    return false;
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  return any_of(MI.all_defs(), [&](const MachineOperand &MO) {
+    Register R = MO.getReg();
+    if (R.isVirtual()) {
+      const TargetRegisterClass *RC = MRI.getRegClass(R);
+      return RC == &SASS::UGPR32RegClass || RC == &SASS::UGPR64RegClass ||
+             RC == &SASS::UGPR128RegClass || RC == &SASS::UPREDRegClass;
+    }
+    return R != SASS::URZ && R != SASS::UPT &&
+           (SASS::UGPR32RegClass.contains(R) ||
+            SASS::UGPR64RegClass.contains(R) ||
+            SASS::UGPR128RegClass.contains(R) ||
+            SASS::UPREDRegClass.contains(R));
+  });
+}
+
+bool SASSInstrInfo::shouldPostRASink(const MachineInstr &MI) const {
+  return !writesUniform(MI);
+}
+
+// MachineSink moves an instruction into the successor dominating its uses
+// even when that successor post-dominates its block (as a step toward a
+// later conditional block), and the per-block pre-RA scheduler cannot move
+// it back. In an unrolled K loop whose steps are separated by conditional
+// loads (a predicated gather's `if`s):
+// * the MMA accumulator chain moved step by step into the epilogue block,
+//   away from each step's loads, which then all stayed live across the chain
+//   (the bs=1 MoE kernel spilled 912 bytes under a 128-register bound);
+// * the prologue's read-only weight loads moved down `if` by `if` to their
+//   first use, so each waited its full latency instead of overlapping the
+//   steps before it.
+// Neither saves work: MMAs stay with their operands, and a memory load (not
+// a constant-bank LDC) does not move past a conditional load's `if`. Nor do
+// uniform register writes (writesUniform).
+bool SASSInstrInfo::shouldSink(const MachineInstr &MI) const {
+  if (writesUniform(MI))
+    return false;
+  // sm_90: nor past a peeled mbarrier poll, whose fast path then waits for
+  // work (an MMA accumulator sum) that could have overlapped the wait.
+  if (!MI.getMF()->getSubtarget<SASSSubtarget>().hasBlackwellISA() &&
+      sinksOnlyIntoJoin(MI, /*Poll=*/true) && !sinksOnlyIntoJoin(MI))
+    return false;
+  switch (MI.getOpcode()) {
+  case SASS::HMMA16816F32:
+  case SASS::HMMA16816F32BF16:
+  case SASS::HMMA16816F32Z:
+  case SASS::HMMA16816F32BF16Z:
+    return false;
+  default:
+    break;
+  }
+  if (!MI.mayLoad() || !SASS::writesSB(MI.getDesc()) ||
+      (!MI.memoperands_empty() &&
+       all_of(MI.memoperands(), [](const MachineMemOperand *MMO) {
+         return MMO->getAddrSpace() == 4;
+       })))
+    return true;
+  return !sinksOnlyIntoJoin(MI);
+}
+
+// Constant banks (kernel parameters, launch geometry, __constant__ data) are
+// read-only while a kernel runs: an unpredicated LDC c[bank][imm] can be
+// re-executed anywhere, so the register allocator reloads such values from
+// the bank instead of spilling them (the generic check rejects these loads
+// because the parameter symbol's memory operands are not dereferenceable).
+bool SASSInstrInfo::isReMaterializableImpl(const MachineInstr &MI) const {
+  switch (MI.getOpcode()) {
+  case SASS::LDCB32_I:
+  case SASS::LDCB64_I:
+  case SASS::LDCBU8_I:
+  case SASS::LDCBS8_I:
+  case SASS::LDCBU16_I:
+  case SASS::LDCBS16_I: {
+    const MachineOperand &Def = MI.getOperand(0);
+    if (Def.getSubReg() || MI.getNumExplicitDefs() != 1)
+      return false;
+    for (const MachineOperand &MO : drop_begin(MI.operands()))
+      if (MO.isReg() && MO.getReg() != SASS::PT)
+        return false;
+    return !isPredicated(MI);
+  }
+  // Hopper: per-thread / per-CTA constants. A re-read costs an S2R
+  // (scoreboarded, tens of cycles) instead of a local-memory reload.
+  case SASS::S2R_TIDX:
+  case SASS::S2R_TIDY:
+  case SASS::S2R_TIDZ:
+  case SASS::S2R_CTAIDX:
+  case SASS::S2R_CTAIDY:
+  case SASS::S2R_CTAIDZ:
+  case SASS::S2R_LANEID:
+  case SASS::S2R_SWINHI:
+    if (!rematALU(MI))
+      return false;
+    return TargetInstrInfo::isReMaterializableImpl(MI);
+  // Hopper: only P0-P6 hold predicates, and a spilled one costs SEL + STL.U8
+  // and LDL.U8 + ISETP on the path that needs it; a compare of values still
+  // live is issued again next to the use instead, as ptxas does.
+  case SASS::ISETPrr:
+  case SASS::ISETPri:
+    if (!rematALU(MI))
+      return false;
+    return TargetInstrInfo::isReMaterializableImpl(MI);
+  default:
+    if (isCheapALU(MI) && !rematALU(MI))
+      return false;
+    return TargetInstrInfo::isReMaterializableImpl(MI);
+  }
+}
+
+// Single-cycle integer ALU ops (IADD3, LOP3, SHF, LEA, SEL, IMAD on the fast
+// path) with only register / immediate operands. On Hopper they are
+// rematerialized next to their uses (operands still live there) instead of
+// being spilled: a loop-invariant index or address otherwise costs a local
+// memory round trip per iteration, and with shared memory taking nearly all
+// of L1 that reload comes from L2.
+bool SASSInstrInfo::isCheapALU(const MachineInstr &MI) {
+  switch (MI.getOpcode()) {
+  case SASS::IADDrr:
+  case SASS::IADDri:
+  case SASS::IADD3rrr:
+  case SASS::IADD3rri:
+  case SASS::ISUBrr:
+  case SASS::IMADrrr:
+  case SASS::IMADrir:
+  case SASS::IMADrri:
+  case SASS::IMADSHLri:
+  case SASS::IMADHIU32:
+  case SASS::IMADHI:
+  case SASS::LOP3rrr:
+  case SASS::LOP3rir:
+  case SASS::SHLrr:
+  case SASS::SHLri:
+  case SASS::SRLrr:
+  case SASS::SRLri:
+  case SASS::SRArr:
+  case SASS::SRAri:
+  case SASS::ROTLrr:
+  case SASS::ROTLri:
+  case SASS::SHLU64HI:
+  case SASS::SHRU64:
+  case SASS::SHRS64:
+  case SASS::SELrr:
+  case SASS::SELri:
+  case SASS::LEArrr:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// (live-range splitting rematerializes only as-cheap-as-a-move defs)
+bool SASSInstrInfo::rematALU(const MachineInstr &MI) const {
+  return RematALU && !isPredicated(MI) &&
+         !MI.getMF()->getSubtarget<SASSSubtarget>().hasBlackwellISA();
+}
+
+bool SASSInstrInfo::isAsCheapAsAMove(const MachineInstr &MI) const {
+  if ((isCheapALU(MI) || MI.getOpcode() == SASS::ISETPrr ||
+       MI.getOpcode() == SASS::ISETPri) &&
+      rematALU(MI))
+    return true;
+  return TargetInstrInfo::isAsCheapAsAMove(MI);
 }
